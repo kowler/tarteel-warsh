@@ -1,0 +1,867 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0a0a0a">
+  <title>ترتيل — حفظ القرآن بالورش</title>
+  <link rel="manifest" href="manifest.json">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    
+    :root {
+      --bg: #0f0f0f;
+      --surface: #1a1a1a;
+      --surface-hover: #242424;
+      --text: #e8e8e8;
+      --text-dim: #555;
+      --accent: #4a9d6a;
+      --accent-glow: rgba(74, 157, 106, 0.3);
+      --accent-dim: #2a5d3a;
+      --error: #c94a4a;
+      --error-dim: rgba(201, 74, 74, 0.2);
+      --warn: #d4a744;
+      --radius: 12px;
+    }
+
+    body {
+      font-family: 'Amiri', 'Noto Naskh Arabic', 'Times New Roman', serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Top bar ── */
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(15,15,15,0.95);
+      backdrop-filter: blur(10px);
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid #222;
+    }
+    .topbar .title { font-size: 18px; font-weight: 600; color: var(--accent); }
+    .topbar select {
+      background: var(--surface); color: var(--text);
+      border: 1px solid #333; border-radius: 8px;
+      padding: 6px 10px; font-size: 14px; font-family: inherit;
+      cursor: pointer; max-width: 180px;
+    }
+    .nav-btns { display: flex; gap: 6px; align-items: center; }
+    .nav-btn {
+      background: var(--surface); border: 1px solid #333; color: var(--text);
+      border-radius: 8px; padding: 6px 12px; font-size: 14px;
+      cursor: pointer; font-family: inherit;
+    }
+    .nav-btn:hover { background: var(--surface-hover); }
+    .nav-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+    .page-jump {
+      display: flex; align-items: center; gap: 4px;
+      background: var(--surface); border: 1px solid #333;
+      border-radius: 8px; padding: 2px 6px;
+    }
+    .page-jump input {
+      width: 42px; text-align: center;
+      background: transparent; border: none; color: var(--text);
+      font-size: 14px; font-family: inherit;
+      outline: none; padding: 4px 0;
+      -moz-appearance: textfield;
+    }
+    .page-jump input::-webkit-outer-spin-button,
+    .page-jump input::-webkit-inner-spin-button {
+      -webkit-appearance: none; margin: 0;
+    }
+    .page-jump span { font-size: 12px; color: var(--text-dim); }
+
+    /* ── Page container ── */
+    .page-container {
+      max-width: 820px;
+      margin: 0 auto;
+      padding: 12px 8px 160px;
+    }
+
+    /* ── Mushaf page with line overlays ── */
+    .mushaf-page {
+      position: relative;
+      width: 100%;
+      margin-bottom: 16px;
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: #fff;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    }
+    .mushaf-page img { width: 100%; display: block; }
+
+    /* ── Line overlay segments ── */
+    .line-segment {
+      position: absolute;
+      left: 1%; right: 1%;
+      transition: all 0.4s ease;
+      border-radius: 4px;
+      pointer-events: none;
+    }
+    .line-segment.hidden {
+      background: rgba(8, 8, 8, 0.93);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+    }
+    .line-segment.revealed {
+      background: transparent;
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
+    }
+    .line-segment.active {
+      background: rgba(8, 8, 8, 0.88);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      box-shadow: inset 0 0 0 2px rgba(74, 157, 106, 0.6);
+    }
+
+    .page-info {
+      text-align: center; font-size: 12px; color: var(--text-dim);
+      padding: 4px 0 8px;
+    }
+
+    /* ── Bottom controls ── */
+    .controls {
+      position: fixed; bottom: 0; left: 0; right: 0;
+      background: rgba(15,15,15,0.95);
+      backdrop-filter: blur(10px);
+      padding: 14px 16px 10px;
+      border-top: 1px solid #222;
+      display: flex; gap: 12px;
+      justify-content: center; align-items: center;
+      z-index: 100;
+    }
+
+    .btn {
+      padding: 12px 24px; border-radius: 50px; border: none;
+      font-size: 16px; font-family: inherit; cursor: pointer;
+      transition: all 0.2s; display: flex; align-items: center; gap: 8px;
+    }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: #5abd7a; }
+    .btn-primary.recording { background: var(--error); animation: pulse 1.5s infinite; }
+    .btn-ghost { background: var(--surface); color: var(--text); border: 1px solid #333; }
+    .btn-ghost:hover { background: var(--surface-hover); }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(201,74,74,0.4); }
+      50% { box-shadow: 0 0 0 8px rgba(201,74,74,0); }
+    }
+
+    .status {
+      font-size: 13px; color: var(--text-dim);
+      text-align: center; padding: 4px 8px;
+      min-height: 20px;
+    }
+    .status.listening { color: var(--accent); }
+    .status.error { color: var(--error); }
+
+    .level-meter {
+      width: 60px; height: 4px; background: #222;
+      border-radius: 2px; overflow: hidden;
+    }
+    .level-meter-fill {
+      height: 100%; width: 0%; background: var(--accent);
+      transition: width 0.05s;
+    }
+
+    /* ── Engine badge ── */
+    .engine-badge {
+      font-size: 10px; color: var(--text-dim);
+      padding: 2px 8px; border-radius: 10px;
+      background: var(--surface); border: 1px solid #333;
+      white-space: nowrap;
+    }
+
+    /* ── Debug panel ── */
+    .debug-panel {
+      position: fixed; bottom: 80px; left: 8px; right: 8px;
+      background: rgba(0,0,0,0.85); color: #0f0;
+      font-family: monospace; font-size: 10px;
+      padding: 6px 8px; border-radius: 8px;
+      max-height: 80px; overflow-y: auto;
+      z-index: 99; display: none;
+      border: 1px solid #333;
+    }
+    .debug-panel.visible { display: block; }
+
+    .loader {
+      text-align: center; padding: 60px 20px; color: var(--text-dim);
+    }
+    .loader .spinner {
+      width: 32px; height: 32px; border: 3px solid #222;
+      border-top-color: var(--accent); border-radius: 50%;
+      animation: spin 0.8s linear infinite; margin: 0 auto 12px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    @media (max-width: 600px) {
+      .page-container { padding: 8px 4px 160px; }
+      .btn { padding: 10px 18px; font-size: 14px; }
+      .topbar select { max-width: 120px; font-size: 12px; }
+      .topbar .title { font-size: 16px; }
+      .topbar { flex-wrap: wrap; gap: 6px; }
+      .nav-btns { order: 3; width: 100%; justify-content: center; }
+    }
+  </style>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Amiri:wght@400;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="topbar">
+    <span class="title">ترتيل</span>
+    <select id="surah-select"></select>
+    <div class="nav-btns">
+      <button class="nav-btn" id="prev-page" disabled>‹ السابق</button>
+      <div class="page-jump">
+        <input type="number" id="page-input" min="1" max="604" value="1">
+        <span id="page-total">/ 604</span>
+      </div>
+      <button class="nav-btn" id="next-page" disabled>التالي ›</button>
+    </div>
+  </div>
+
+  <div class="page-container" id="page-container">
+    <div class="loader">
+      <div class="spinner"></div>
+      <p>جاري تحميل المصحف...</p>
+    </div>
+  </div>
+
+  <div class="debug-panel" id="debug-panel"></div>
+
+  <div class="controls">
+    <span class="engine-badge" id="engine-badge">—</span>
+    <div class="level-meter"><div class="level-meter-fill" id="level-fill"></div></div>
+    <button class="btn btn-primary" id="recite-btn" disabled>
+      <span id="recite-icon">🎙️</span>
+      <span id="recite-text">ابدأ التلاوة</span>
+    </button>
+    <button class="btn btn-ghost" id="reset-btn">إعادة</button>
+    <button class="btn btn-ghost" id="debug-btn" style="padding:8px 12px;font-size:12px">🐛</button>
+  </div>
+
+  <div class="status" id="status"></div>
+
+  <script>
+    // ============================================================
+    // Tarteel-Warsh — Pure browser PWA
+    // No backend, no Groq, no server-side processing.
+    //
+    // Word counting (primary): Web Speech API
+    //   Works on Chrome, Edge, Safari (all platforms: Windows,
+    //   macOS, Linux, Android, iOS). NOT on Firefox.
+    //
+    // Word counting (fallback): Energy-based syllable pulse counting
+    //   Works on any browser with mic access (including Firefox).
+    //   Uses RMS amplitude spikes to detect spoken syllables.
+    //
+    // Line reveal: each line has a known word count from the mushaf
+    // text data. When enough words/syllables are spoken to fill the
+    // current line, reveal it. Simple, transport-agnostic.
+    // ============================================================
+
+    // ============================================================
+    // State
+    // ============================================================
+    const State = {
+      data: null,
+      currentPage: 1,
+      pageLines: [],
+      currentLine: 0,
+      allWords: [],
+      isReciting: false,
+      audioContext: null,
+      mediaStream: null,
+      analyser: null,
+      vadInterval: null,
+      segmentEls: [],
+      imgEl: null,
+      speechRecognition: null,
+      // Word counting state
+      thresholds: null,
+      revealState: null,
+      engine: null,  // 'speech-api' | 'energy'
+    };
+
+    // ============================================================
+    // Debug logging
+    // ============================================================
+    function dbg(msg) {
+      console.log('[DBG] ' + msg);
+      const panel = document.getElementById('debug-panel');
+      if (panel.classList.contains('visible')) {
+        const time = new Date().toLocaleTimeString();
+        panel.innerHTML = `<div>[${time}] ${msg}</div>` + panel.innerHTML;
+        const lines = panel.children;
+        if (lines.length > 20) panel.removeChild(panel[lines.length - 1]);
+      }
+    }
+
+    // ============================================================
+    // Load data
+    // ============================================================
+    async function loadData() {
+      try {
+        const res = await fetch('quran-warsh-pages.json');
+        State.data = await res.json();
+        populateSurahSelect();
+        State.currentPage = 1;
+        renderPage(1);
+        document.getElementById('recite-btn').disabled = false;
+      } catch (e) {
+        document.getElementById('page-container').innerHTML =
+          '<div class="loader"><p style="color:var(--error)">فشل تحميل المصحف</p></div>';
+        console.error('Load error:', e);
+      }
+    }
+
+    function populateSurahSelect() {
+      const sel = document.getElementById('surah-select');
+      sel.innerHTML = State.data.surahs.map(s =>
+        `<option value="${s.num}">${s.num}. ${s.name}</option>`
+      ).join('');
+      sel.addEventListener('change', e => {
+        const surahNum = parseInt(e.target.value);
+        for (const page of State.data.pages) {
+          if (page.ayahs.some(a => a.sura === surahNum)) {
+            renderPage(page.page);
+            break;
+          }
+        }
+      });
+    }
+
+    // ============================================================
+    // Build per-line word arrays
+    // ============================================================
+    function buildPageLines(page) {
+      const lineMap = new Map();
+      for (const ayah of page.ayahs) {
+        const words = ayah.words.filter(w => w && w.trim().length > 0);
+        const lineSpan = ayah.lineEnd - ayah.lineStart + 1;
+        if (lineSpan <= 1) {
+          const ln = ayah.lineStart;
+          if (!lineMap.has(ln)) lineMap.set(ln, []);
+          lineMap.get(ln).push(...words.map(w => ({ text: w, sura: ayah.sura, aya: ayah.aya })));
+        } else {
+          const perLine = Math.ceil(words.length / lineSpan);
+          for (let i = 0; i < lineSpan; i++) {
+            const ln = ayah.lineStart + i;
+            if (!lineMap.has(ln)) lineMap.set(ln, []);
+            const chunk = words.slice(i * perLine, (i + 1) * perLine);
+            lineMap.get(ln).push(...chunk.map(w => ({ text: w, sura: ayah.sura, aya: ayah.aya })));
+          }
+        }
+      }
+      const sortedLines = [...lineMap.keys()].sort((a, b) => a - b);
+      return sortedLines.map(ln => ({
+        lineNum: ln,
+        words: lineMap.get(ln),
+        revealed: false,
+      }));
+    }
+
+    // ============================================================
+    // Render page with line overlays
+    // ============================================================
+    function renderPage(pageNum) {
+      const page = State.data.pages.find(p => p.page === pageNum);
+      if (!page) return;
+      State.currentPage = pageNum;
+      State.pageLines = buildPageLines(page);
+      State.currentLine = 0;
+      State.allWords = [];
+      for (let li = 0; li < State.pageLines.length; li++) {
+        for (const w of State.pageLines[li].words) {
+          State.allWords.push({ text: w.text, lineIdx: li });
+        }
+      }
+
+      const container = document.getElementById('page-container');
+      container.innerHTML = '';
+
+      const info = document.createElement('div');
+      info.className = 'page-info';
+      info.textContent = `صفحة ${pageNum} • الجزء ${page.juz}`;
+      container.appendChild(info);
+
+      const pageDiv = document.createElement('div');
+      pageDiv.className = 'mushaf-page';
+      const img = document.createElement('img');
+      img.src = `https://raw.githubusercontent.com/QuranHub/quran-pages-images/main/kfgqpc/warsh/${pageNum}.jpg`;
+      img.alt = `مصحف ورش - صفحة ${pageNum}`;
+      img.loading = 'lazy';
+
+      // When image loads, create 15 equal-height line overlays.
+      // Every standard mushaf page has exactly 15 line positions.
+      // We map each data line to its absolute line number (1-15),
+      // so surah headers (which occupy a line position but have no
+      // text data) are naturally skipped.
+      img.onload = () => {
+        dbg(`Image loaded: ${img.naturalWidth}x${img.naturalHeight}`);
+
+        const TOTAL_LINES = 15;
+        const TEXT_TOP = 4.0;
+        const TEXT_BOTTOM = 96.0;
+        const lineH = (TEXT_BOTTOM - TEXT_TOP) / TOTAL_LINES;
+        const bands = [];
+        for (let i = 0; i < TOTAL_LINES; i++) {
+          bands.push({
+            top: TEXT_TOP + i * lineH,
+            bottom: TEXT_TOP + (i + 1) * lineH
+          });
+        }
+
+        for (let i = 0; i < State.pageLines.length; i++) {
+          const lineData = State.pageLines[i];
+          const bandIdx = Math.min(lineData.lineNum - 1, TOTAL_LINES - 1);
+          const band = bands[bandIdx];
+
+          const seg = document.createElement('div');
+          seg.className = 'line-segment hidden';
+          seg.style.top = band.top + '%';
+          seg.style.height = (band.bottom - band.top) + '%';
+          seg.dataset.lineIdx = i;
+          pageDiv.appendChild(seg);
+          State.segmentEls.push(seg);
+        }
+        dbg(`Created ${State.segmentEls.length} line overlays`);
+      };
+
+      pageDiv.appendChild(img);
+      State.imgEl = img;
+      container.appendChild(pageDiv);
+      State.segmentEls = [];
+
+      document.getElementById('prev-page').disabled = pageNum <= 1;
+      document.getElementById('next-page').disabled = pageNum >= State.data.meta.totalPages;
+      const pageInput = document.getElementById('page-input');
+      pageInput.value = pageNum;
+      pageInput.max = State.data.meta.totalPages;
+      document.getElementById('page-total').textContent = '/ ' + State.data.meta.totalPages;
+      const firstAyah = page.ayahs[0];
+      if (firstAyah) document.getElementById('surah-select').value = firstAyah.sura;
+      const surahName = firstAyah ? firstAyah.suraName : '';
+      updateStatus(`صفحة ${pageNum} — ${surahName}`);
+    }
+
+    // ============================================================
+    // Line reveal logic
+    // ============================================================
+    function revealLine(lineIdx) {
+      const seg = State.segmentEls[lineIdx];
+      if (!seg) return;
+      seg.classList.remove('hidden', 'active');
+      seg.classList.add('revealed');
+      State.pageLines[lineIdx].revealed = true;
+      dbg(`Revealed line ${lineIdx}`);
+
+      if (lineIdx + 1 < State.segmentEls.length) {
+        setActiveLine(lineIdx + 1);
+      }
+    }
+
+    function setActiveLine(lineIdx) {
+      State.segmentEls.forEach(s => {
+        if (s.classList.contains('active')) {
+          s.classList.remove('active');
+          s.classList.add('hidden');
+        }
+      });
+      const seg = State.segmentEls[lineIdx];
+      if (seg && !seg.classList.contains('revealed')) {
+        seg.classList.remove('hidden');
+        seg.classList.add('active');
+      }
+    }
+
+    // ============================================================
+    // Word-counting line reveal
+    // Each line has a known word count from the mushaf text data.
+    // When enough words are spoken to fill the current line, reveal it.
+    // ============================================================
+
+    function buildWordThresholds() {
+      const lineWordCounts = State.pageLines.map(pl => pl.words.length);
+      const cumulativeThresholds = [];
+      let cum = 0;
+      for (const wc of lineWordCounts) {
+        cum += wc;
+        cumulativeThresholds.push(cum);
+      }
+      dbg(`Word counts per line: [${lineWordCounts.join(', ')}]`);
+      dbg(`Cumulative thresholds: [${cumulativeThresholds.join(', ')}]`);
+      return { lineWordCounts, cumulativeThresholds };
+    }
+
+    function revealUpToWordCount(spokenWords, thresholds, state) {
+      while (state.nextLineToReveal < thresholds.cumulativeThresholds.length &&
+             spokenWords >= thresholds.cumulativeThresholds[state.nextLineToReveal]) {
+        if (state.nextLineToReveal < State.pageLines.length) {
+          revealLine(state.nextLineToReveal);
+          dbg(`Revealed line ${state.nextLineToReveal} at word ${spokenWords}/${thresholds.cumulativeThresholds[state.nextLineToReveal]}`);
+          State.currentLine = state.nextLineToReveal + 1;
+        }
+        state.nextLineToReveal++;
+      }
+
+      if (State.currentLine < State.pageLines.length) {
+        setActiveLine(State.currentLine);
+        const remaining = thresholds.cumulativeThresholds[State.currentLine] - spokenWords;
+        updateStatus(` السطر ${State.currentLine + 1} — بقيت ${Math.max(0, remaining)} كلمة `, 'listening');
+      } else {
+        updateStatus(' ✓ اكتملت الصفحة! ', 'listening');
+      }
+    }
+
+    // ============================================================
+    // Recitation — tries Web Speech API first, falls back to
+    // energy-based syllable counting.
+    // ============================================================
+
+    async function startReciting() {
+      State.isReciting = true;
+      updateReciteButton();
+      updateStatus(' يرتل... ', 'listening');
+      setActiveLine(State.currentLine);
+
+      // Build word thresholds for this page
+      State.thresholds = buildWordThresholds();
+      State.revealState = { nextLineToReveal: 0 };
+
+      // Try Web Speech API (Chrome, Edge, Safari — all platforms)
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SpeechRecognition) {
+        dbg('Web Speech API available — trying it');
+        try {
+          startSpeechApiCounting(SpeechRecognition);
+          return;
+        } catch (e) {
+          dbg('Speech API start failed: ' + e.message + ' — falling back to energy-based');
+        }
+      } else {
+        dbg('Web Speech API not available — using energy-based counting');
+      }
+
+      // Fallback: energy-based syllable counting
+      await startEnergyBasedCounting();
+    }
+
+    // ── Web Speech API word counting ──
+    function startSpeechApiCounting(SpeechRecognition) {
+      const recognition = new SpeechRecognition();
+      recognition.lang = 'ar-SA';
+      recognition.continuous = true;
+      recognition.interimResults = true;
+
+      let spokenWords = 0;
+      let speechApiWorking = false;
+      let sessionOffset = 0;
+      let reciteStart = Date.now();
+
+      // Quran recitation compensation:
+      // Wasl (word joining), madd, idgham cause API to undercount.
+      // Typical undercount: 25-40% in tarteel recitation.
+      const COMPENSATION = 1.45;
+      // Duration-based floor: in tarteel, ~2.0 words/sec minimum
+      const WORDS_PER_SEC = 2.0;
+      const MIN_SPEAK_MS = 3000;
+
+      recognition.onstart = () => {
+        speechApiWorking = true;
+        sessionOffset = spokenWords;
+        State.engine = 'speech-api';
+        updateEngineBadge();
+        dbg(`Speech API (re)started — offset=${sessionOffset}`);
+      };
+
+      recognition.onresult = (event) => {
+        let sessionWords = 0;
+        for (let i = 0; i < event.results.length; i++) {
+          const transcript = event.results[i][0].transcript;
+          const words = transcript.trim().split(/\s+/).filter(w => w.length > 0);
+          sessionWords += words.length;
+        }
+
+        const compensatedSession = Math.round(sessionWords * COMPENSATION);
+        let total = sessionOffset + compensatedSession;
+
+        // Duration-based floor
+        const elapsedSec = (Date.now() - reciteStart) / 1000;
+        if (elapsedSec > MIN_SPEAK_MS / 1000) {
+          const durationFloor = Math.round(elapsedSec * WORDS_PER_SEC);
+          if (durationFloor > total) {
+            dbg(`Duration floor: ${durationFloor} > speech ${total}, using floor`);
+            total = durationFloor;
+          }
+        }
+
+        if (total > spokenWords) {
+          spokenWords = total;
+          dbg(`Words: ${spokenWords} (session=${sessionWords}, comp=${compensatedSession}, offset=${sessionOffset}, elapsed=${elapsedSec.toFixed(1)}s)`);
+          revealUpToWordCount(spokenWords, State.thresholds, State.revealState);
+        }
+      };
+
+      recognition.onerror = (e) => {
+        dbg('Speech API error: ' + e.error);
+        if (e.error === 'no-speech' || e.error === 'aborted') return;
+        // On fatal errors, fall back to energy-based
+        if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+          dbg('Speech API not allowed — falling back to energy-based');
+          try { recognition.stop(); } catch (err) {}
+          State.speechRecognition = null;
+          startEnergyBasedCounting();
+        }
+      };
+
+      recognition.onend = () => {
+        if (State.isReciting && speechApiWorking) {
+          dbg('Speech API ended, restarting...');
+          try { recognition.start(); } catch (e) { dbg('Restart failed: ' + e.message); }
+        }
+      };
+
+      State.speechRecognition = recognition;
+      recognition.start();
+
+      // Give it 3 seconds — if no onstart, fall back
+      setTimeout(() => {
+        if (!speechApiWorking && State.isReciting && State.engine !== 'speech-api') {
+          dbg('Speech API did not start in 3s — falling back to energy-based');
+          try { recognition.stop(); } catch (e) {}
+          State.speechRecognition = null;
+          startEnergyBasedCounting();
+        }
+      }, 3000);
+    }
+
+    // ── Energy-based syllable pulse counting (fallback) ──
+    // Uses microphone RMS amplitude to detect syllable pulses.
+    // Each pulse ≈ one spoken word. Works on any browser with mic.
+    async function startEnergyBasedCounting() {
+      try {
+        dbg('Requesting mic for energy-based counting...');
+        State.mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            sampleRate: 16000,
+            echoCancellation: true,
+            noiseSuppression: true,
+          }
+        });
+        dbg('Mic granted');
+
+        State.audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+        if (State.audioContext.state === 'suspended') {
+          await State.audioContext.resume();
+        }
+
+        const source = State.audioContext.createMediaStreamSource(State.mediaStream);
+        State.analyser = State.audioContext.createAnalyser();
+        State.analyser.fftSize = 512;
+        State.analyser.smoothingTimeConstant = 0.3;
+        source.connect(State.analyser);
+
+        State.engine = 'energy';
+        updateEngineBadge();
+        updateStatus(' يرتل... ', 'listening');
+
+        const dataArray = new Uint8Array(State.analyser.frequencyBinCount);
+        let spokenWords = 0;
+        let isSpeaking = false;
+        let baseline = 0;
+        let lastPulse = 0;
+        const BASELINE_DECAY = 0.995;
+        const PULSE_THRESHOLD = 1.6;
+        const PULSE_COOLDOWN_MS = 250;
+        const START_THRESHOLD = 12;
+        const STOP_THRESHOLD = 4;
+        const SILENCE_RESET_MS = 2000;
+        let silenceStart = 0;
+
+        State.vadInterval = setInterval(() => {
+          if (!State.isReciting) return;
+          State.analyser.getByteTimeDomainData(dataArray);
+
+          let sum = 0;
+          for (let i = 0; i < dataArray.length; i++) {
+            const v = (dataArray[i] - 128) / 128;
+            sum += v * v;
+          }
+          const rms = Math.sqrt(sum / dataArray.length) * 100;
+          document.getElementById('level-fill').style.width = Math.min(100, rms * 5) + '%';
+          const now = Date.now();
+
+          if (isSpeaking) {
+            baseline = baseline * BASELINE_DECAY + rms * (1 - BASELINE_DECAY);
+          }
+
+          if (!isSpeaking) {
+            if (rms > START_THRESHOLD) {
+              isSpeaking = true;
+              baseline = rms * 0.7;
+              silenceStart = 0;
+              updateStatus(' يرتل... ', 'listening');
+            }
+            return;
+          }
+
+          if (rms > baseline * PULSE_THRESHOLD && rms > START_THRESHOLD &&
+              now - lastPulse > PULSE_COOLDOWN_MS) {
+            lastPulse = now;
+            spokenWords++;
+            dbg(`Pulse word #${spokenWords} (rms=${rms.toFixed(1)}, baseline=${baseline.toFixed(1)})`);
+            revealUpToWordCount(spokenWords, State.thresholds, State.revealState);
+          }
+
+          if (rms < STOP_THRESHOLD) {
+            if (silenceStart === 0) silenceStart = now;
+            if (now - silenceStart > SILENCE_RESET_MS) {
+              isSpeaking = false;
+              silenceStart = 0;
+              baseline = 0;
+              updateStatus(' يستمع... ', 'listening');
+            }
+          } else {
+            silenceStart = 0;
+          }
+        }, 40);
+
+      } catch (e) {
+        dbg('Energy-based mic error: ' + e.message);
+        updateStatus(' فشل الميكروفون: ' + e.message, 'error');
+        State.isReciting = false;
+        updateReciteButton();
+      }
+    }
+
+    // ============================================================
+    // Stop recitation
+    // ============================================================
+    function stopReciting() {
+      State.isReciting = false;
+      if (State.speechRecognition) {
+        try { State.speechRecognition.stop(); } catch (e) {}
+        State.speechRecognition = null;
+      }
+      if (State.vadInterval) { clearInterval(State.vadInterval); State.vadInterval = null; }
+      if (State.mediaStream) { State.mediaStream.getTracks().forEach(t => t.stop()); State.mediaStream = null; }
+      if (State.audioContext) { State.audioContext.close(); State.audioContext = null; }
+      State.analyser = null;
+      State.engine = null;
+      updateEngineBadge();
+      document.getElementById('level-fill').style.width = '0%';
+      State.segmentEls.forEach(s => {
+        if (s.classList.contains('active')) {
+          s.classList.remove('active');
+          s.classList.add('hidden');
+        }
+      });
+      updateReciteButton();
+      updateStatus('');
+    }
+
+    // ============================================================
+    // UI helpers
+    // ============================================================
+    function updateReciteButton() {
+      const btn = document.getElementById('recite-btn');
+      const icon = document.getElementById('recite-icon');
+      const text = document.getElementById('recite-text');
+      if (State.isReciting) {
+        btn.classList.add('recording');
+        icon.textContent = '⏹️';
+        text.textContent = 'إيقاف';
+      } else {
+        btn.classList.remove('recording');
+        icon.textContent = '🎙️';
+        text.textContent = 'ابدأ التلاوة';
+      }
+    }
+
+    function updateStatus(text, cls = '') {
+      const el = document.getElementById('status');
+      el.textContent = text;
+      el.className = 'status ' + cls;
+    }
+
+    function updateEngineBadge() {
+      const badge = document.getElementById('engine-badge');
+      if (State.engine === 'speech-api') badge.textContent = 'Speech API';
+      else if (State.engine === 'energy') badge.textContent = 'Energy';
+      else badge.textContent = '—';
+    }
+
+    function resetPage() {
+      stopReciting();
+      renderPage(State.currentPage);
+    }
+
+    function nextPage() {
+      if (State.currentPage < State.data.meta.totalPages) {
+        stopReciting();
+        renderPage(State.currentPage + 1);
+      }
+    }
+
+    function prevPage() {
+      if (State.currentPage > 1) {
+        stopReciting();
+        renderPage(State.currentPage - 1);
+      }
+    }
+
+    // ============================================================
+    // Event listeners
+    // ============================================================
+    document.getElementById('recite-btn').addEventListener('click', () => {
+      if (State.isReciting) stopReciting(); else startReciting();
+    });
+    document.getElementById('reset-btn').addEventListener('click', resetPage);
+    document.getElementById('next-page').addEventListener('click', nextPage);
+    document.getElementById('prev-page').addEventListener('click', prevPage);
+    document.getElementById('page-input').addEventListener('change', e => {
+      const page = parseInt(e.target.value);
+      const max = State.data.meta.totalPages;
+      if (isNaN(page) || page < 1 || page > max) {
+        e.target.value = State.currentPage;
+        return;
+      }
+      if (page !== State.currentPage) {
+        stopReciting();
+        renderPage(page);
+      }
+    });
+    document.getElementById('page-input').addEventListener('keydown', e => {
+      if (e.key === 'Enter') e.target.blur();
+    });
+    document.getElementById('debug-btn').addEventListener('click', () => {
+      document.getElementById('debug-panel').classList.toggle('visible');
+    });
+
+    document.addEventListener('keydown', e => {
+      if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
+      if (e.key === 'ArrowLeft') nextPage();
+      if (e.key === 'ArrowRight') prevPage();
+    });
+
+    // ============================================================
+    // Init
+    // ============================================================
+    loadData();
+  </script>
+</body>
+</html>
