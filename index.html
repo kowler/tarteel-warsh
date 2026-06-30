@@ -541,10 +541,38 @@
       State.thresholds = buildWordThresholds();
       State.revealState = { nextLineToReveal: 0 };
 
-      // Try Web Speech API (Chrome, Edge, Safari — all platforms)
+      // Step 1: Request mic permission via getUserMedia().
+      // This triggers the browser's mic permission prompt — essential
+      // for both Web Speech API and energy-based counting to work.
+      // Without this explicit prompt, Speech API can fail silently
+      // with "not-allowed" on some browsers (desktop Chrome, Edge).
+      try {
+        dbg('Requesting mic permission...');
+        State.mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            sampleRate: 16000,
+            echoCancellation: true,
+            noiseSuppression: true,
+          }
+        });
+        dbg('Mic permission granted');
+      } catch (e) {
+        dbg('Mic permission denied: ' + e.message);
+        updateStatus(' يجب السماح بالميكروفون لبدء التلاوة ', 'error');
+        State.isReciting = false;
+        updateReciteButton();
+        return;
+      }
+
+      // Step 2: Try Web Speech API (Chrome, Edge, Safari — all platforms).
+      // Now that mic permission is granted, Speech API should work.
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
       if (SpeechRecognition) {
         dbg('Web Speech API available — trying it');
+        // Release the getUserMedia stream — Speech API manages its own mic
+        State.mediaStream.getTracks().forEach(t => t.stop());
+        State.mediaStream = null;
         try {
           startSpeechApiCounting(SpeechRecognition);
           return;
@@ -555,7 +583,8 @@
         dbg('Web Speech API not available — using energy-based counting');
       }
 
-      // Fallback: energy-based syllable counting
+      // Step 3: Fallback — energy-based syllable counting.
+      // Re-acquire the mic stream (permission already granted).
       await startEnergyBasedCounting();
     }
 
@@ -653,16 +682,19 @@
     // Each pulse ≈ one spoken word. Works on any browser with mic.
     async function startEnergyBasedCounting() {
       try {
-        dbg('Requesting mic for energy-based counting...');
-        State.mediaStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            channelCount: 1,
-            sampleRate: 16000,
-            echoCancellation: true,
-            noiseSuppression: true,
-          }
-        });
-        dbg('Mic granted');
+        // Reuse existing mic stream if we already have one
+        if (!State.mediaStream) {
+          dbg('Requesting mic for energy-based counting...');
+          State.mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              channelCount: 1,
+              sampleRate: 16000,
+              echoCancellation: true,
+              noiseSuppression: true,
+            }
+          });
+        }
+        dbg('Mic ready for energy-based counting');
 
         State.audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
         if (State.audioContext.state === 'suspended') {
