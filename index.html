@@ -217,6 +217,7 @@
   </style>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Amiri:wght@400;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
 </head>
 <body>
   <div class="topbar">
@@ -677,14 +678,15 @@
       }, 3000);
     }
 
-    // ── Energy-based syllable pulse counting (fallback) ──
-    // Uses microphone RMS amplitude to detect syllable pulses.
-    // Each pulse ≈ one spoken word. Works on any browser with mic.
+    // ── Silero VAD word counting (fallback) ──
+    // Uses Silero VAD (2MB ONNX model) to detect speech segments.
+    // Counts speech bursts as words — much more accurate than energy-based.
+    // Runs entirely in-browser via ONNX Runtime Web (WASM backend).
     async function startEnergyBasedCounting() {
       try {
         // Reuse existing mic stream if we already have one
         if (!State.mediaStream) {
-          dbg('Requesting mic for energy-based counting...');
+          dbg('Requesting mic for VAD counting...');
           State.mediaStream = await navigator.mediaDevices.getUserMedia({
             audio: {
               channelCount: 1,
@@ -694,7 +696,7 @@
             }
           });
         }
-        dbg('Mic ready for energy-based counting');
+        dbg('Mic ready for VAD counting');
 
         State.audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
         if (State.audioContext.state === 'suspended') {
@@ -707,77 +709,208 @@
         State.analyser.smoothingTimeConstant = 0.3;
         source.connect(State.analyser);
 
-        State.engine = 'energy';
+        State.engine = 'silero-vad';
         updateEngineBadge();
         updateStatus(' يرتل... ', 'listening');
 
-        const dataArray = new Uint8Array(State.analyser.frequencyBinCount);
+        // Load Silero VAD ONNX model
+        let vadSession = null;
+        try {
+          dbg('Loading Silero VAD model...');
+          vadSession = await ort.InferenceSession.create('silero_vad.onnx', {
+            executionProviders: ['wasm'],
+            graphOptimizationLevel: 'all',
+          });
+          dbg(`Silero VAD loaded: ${vadSession.inputNames} → ${vadSession.outputNames}`);
+        } catch (e) {
+          dbg('Failed to load Silero VAD: ' + e.message + ' — falling back to energy-based');
+          return startEnergyBasedFallback();
+        }
+
+        // VAD state: [h, c] — LSTM hidden states, shape [2, 1, 128]
+        let vadState = new Float32Array(2 * 1 * 128); // zeros
+        const SR = 16000;
+        const CHUNK_SIZE = 512; // Silero expects 512 samples at 16kHz
+        const SPEECH_THRESHOLD = 0.5;
+        const SILENCE_THRESHOLD = 0.35;
+        const MIN_SPEECH_MS = 250;  // ignore very short bursts
+        const SILENCE_RESET_MS = 600; // end of speech segment
+
+        // Audio capture via ScriptProcessor (simple, works everywhere)
+        const BUFFER_SIZE = 4096;
+        const scriptProcessor = State.audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
+        let audioBuffer = [];
+
+        scriptProcessor.onaudioprocess = (e) => {
+          if (!State.isReciting) return;
+          const input = e.inputBuffer.getChannelData(0);
+          const copy = new Float32Array(input.length);
+          copy.set(input);
+          audioBuffer.push(copy);
+        };
+
+        const gainNode = State.audioContext.createGain();
+        gainNode.gain.value = 0;
+        source.connect(scriptProcessor);
+        scriptProcessor.connect(gainNode);
+        gainNode.connect(State.audioContext.destination);
+
+        // Process audio in 512-sample chunks via Silero VAD
         let spokenWords = 0;
         let isSpeaking = false;
-        let baseline = 0;
-        let lastPulse = 0;
-        const BASELINE_DECAY = 0.995;
-        const PULSE_THRESHOLD = 1.6;
-        const PULSE_COOLDOWN_MS = 250;
-        const START_THRESHOLD = 12;
-        const STOP_THRESHOLD = 4;
-        const SILENCE_RESET_MS = 2000;
+        let speechStart = 0;
+        let lastSpeechTime = 0;
         let silenceStart = 0;
 
-        State.vadInterval = setInterval(() => {
+        async function processVadChunk() {
           if (!State.isReciting) return;
-          State.analyser.getByteTimeDomainData(dataArray);
 
-          let sum = 0;
-          for (let i = 0; i < dataArray.length; i++) {
-            const v = (dataArray[i] - 128) / 128;
-            sum += v * v;
-          }
-          const rms = Math.sqrt(sum / dataArray.length) * 100;
-          document.getElementById('level-fill').style.width = Math.min(100, rms * 5) + '%';
-          const now = Date.now();
+          // Need at least CHUNK_SIZE samples
+          if (audioBuffer.length === 0) return;
 
-          if (isSpeaking) {
-            baseline = baseline * BASELINE_DECAY + rms * (1 - BASELINE_DECAY);
-          }
+          // Flatten available audio
+          const totalLen = audioBuffer.reduce((s, a) => s + a.length, 0);
+          if (totalLen < CHUNK_SIZE) return;
 
-          if (!isSpeaking) {
-            if (rms > START_THRESHOLD) {
-              isSpeaking = true;
-              baseline = rms * 0.7;
-              silenceStart = 0;
-              updateStatus(' يرتل... ', 'listening');
+          const flat = new Float32Array(totalLen);
+          let off = 0;
+          for (const a of audioBuffer) { flat.set(a, off); off += a.length; }
+          audioBuffer = [];
+
+          // Process in 512-sample chunks
+          const numChunks = Math.floor(flat.length / CHUNK_SIZE);
+          for (let i = 0; i < numChunks; i++) {
+            const chunk = flat.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+
+            // Run VAD inference
+            const inputTensor = new ort.Tensor('float32', chunk, [1, CHUNK_SIZE]);
+            const stateTensor = new ort.Tensor('float32', vadState, [2, 1, 128]);
+            const srTensor = new ort.Tensor('int64', new BigInt64Array([BigInt(SR)]), []);
+
+            try {
+              const results = await vadSession.run({
+                [vadSession.inputNames[0]]: inputTensor,
+                [vadSession.inputNames[1]]: stateTensor,
+                [vadSession.inputNames[2]]: srTensor,
+              });
+
+              // Get speech probability
+              const output = results[vadSession.outputNames[0]];
+              const prob = output.data[0];
+              vadState = results[vadSession.outputNames[1]].data;
+
+              // Update level meter
+              document.getElementById('level-fill').style.width = Math.min(100, prob * 100) + '%';
+
+              const now = Date.now();
+
+              if (prob > SPEECH_THRESHOLD) {
+                if (!isSpeaking) {
+                  isSpeaking = true;
+                  speechStart = now;
+                  silenceStart = 0;
+                  dbg(`VAD: speech started (prob=${prob.toFixed(3)})`);
+                }
+                lastSpeechTime = now;
+              } else if (prob < SILENCE_THRESHOLD) {
+                if (isSpeaking) {
+                  if (silenceStart === 0) silenceStart = now;
+                  if (now - silenceStart > SILENCE_RESET_MS) {
+                    const speechDur = lastSpeechTime - speechStart;
+                    if (speechDur > MIN_SPEECH_MS) {
+                      // Count this speech burst as one word
+                      spokenWords++;
+                      dbg(`VAD: word #${spokenWords} (dur=${speechDur}ms, prob_peak=${prob.toFixed(3)})`);
+                      revealUpToWordCount(spokenWords, State.thresholds, State.revealState);
+                    }
+                    isSpeaking = false;
+                    silenceStart = 0;
+                  }
+                }
+              }
+            } catch (e) {
+              dbg('VAD inference error: ' + e.message);
             }
-            return;
           }
+        }
 
-          if (rms > baseline * PULSE_THRESHOLD && rms > START_THRESHOLD &&
-              now - lastPulse > PULSE_COOLDOWN_MS) {
-            lastPulse = now;
-            spokenWords++;
-            dbg(`Pulse word #${spokenWords} (rms=${rms.toFixed(1)}, baseline=${baseline.toFixed(1)})`);
-            revealUpToWordCount(spokenWords, State.thresholds, State.revealState);
-          }
-
-          if (rms < STOP_THRESHOLD) {
-            if (silenceStart === 0) silenceStart = now;
-            if (now - silenceStart > SILENCE_RESET_MS) {
-              isSpeaking = false;
-              silenceStart = 0;
-              baseline = 0;
-              updateStatus(' يستمع... ', 'listening');
-            }
-          } else {
-            silenceStart = 0;
-          }
-        }, 40);
+        // Poll for audio chunks every 64ms (process ~2-3 VAD chunks per tick)
+        State.vadInterval = setInterval(processVadChunk, 64);
 
       } catch (e) {
-        dbg('Energy-based mic error: ' + e.message);
+        dbg('VAD mic error: ' + e.message);
         updateStatus(' فشل الميكروفون: ' + e.message, 'error');
         State.isReciting = false;
         updateReciteButton();
       }
+    }
+
+    // ── Energy-based fallback (if Silero VAD fails to load) ──
+    async function startEnergyBasedFallback() {
+      const dataArray = new Uint8Array(State.analyser.frequencyBinCount);
+      let spokenWords = 0;
+      let isSpeaking = false;
+      let baseline = 0;
+      let lastPulse = 0;
+      const BASELINE_DECAY = 0.995;
+      const PULSE_THRESHOLD = 1.6;
+      const PULSE_COOLDOWN_MS = 250;
+      const START_THRESHOLD = 12;
+      const STOP_THRESHOLD = 4;
+      const SILENCE_RESET_MS = 2000;
+      let silenceStart = 0;
+
+      State.engine = 'energy';
+      updateEngineBadge();
+      updateStatus(' يرتل... ', 'listening');
+
+      State.vadInterval = setInterval(() => {
+        if (!State.isReciting) return;
+        State.analyser.getByteTimeDomainData(dataArray);
+
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          const v = (dataArray[i] - 128) / 128;
+          sum += v * v;
+        }
+        const rms = Math.sqrt(sum / dataArray.length) * 100;
+        document.getElementById('level-fill').style.width = Math.min(100, rms * 5) + '%';
+        const now = Date.now();
+
+        if (isSpeaking) {
+          baseline = baseline * BASELINE_DECAY + rms * (1 - BASELINE_DECAY);
+        }
+
+        if (!isSpeaking) {
+          if (rms > START_THRESHOLD) {
+            isSpeaking = true;
+            baseline = rms * 0.7;
+            silenceStart = 0;
+            updateStatus(' يرتل... ', 'listening');
+          }
+          return;
+        }
+
+        if (rms > baseline * PULSE_THRESHOLD && rms > START_THRESHOLD &&
+            now - lastPulse > PULSE_COOLDOWN_MS) {
+          lastPulse = now;
+          spokenWords++;
+          dbg(`Pulse word #${spokenWords} (rms=${rms.toFixed(1)}, baseline=${baseline.toFixed(1)})`);
+          revealUpToWordCount(spokenWords, State.thresholds, State.revealState);
+        }
+
+        if (rms < STOP_THRESHOLD) {
+          if (silenceStart === 0) silenceStart = now;
+          if (now - silenceStart > SILENCE_RESET_MS) {
+            isSpeaking = false;
+            silenceStart = 0;
+            baseline = 0;
+            updateStatus(' يستمع... ', 'listening');
+          }
+        } else {
+          silenceStart = 0;
+        }
+      }, 40);
     }
 
     // ============================================================
@@ -833,6 +966,7 @@
     function updateEngineBadge() {
       const badge = document.getElementById('engine-badge');
       if (State.engine === 'speech-api') badge.textContent = 'Speech API';
+      else if (State.engine === 'silero-vad') badge.textContent = 'VAD';
       else if (State.engine === 'energy') badge.textContent = 'Energy';
       else badge.textContent = '—';
     }
