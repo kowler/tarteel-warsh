@@ -237,7 +237,7 @@
     @media (max-width: 600px) {
       .page-container { padding: 8px 4px 160px; }
       .btn { padding: 10px 18px; font-size: 14px; }
-      .topbar select { max-width: 120px; font-size: 12px; }
+      .topbar select { max-width: 110px; font-size: 12px; }
       .topbar .title { font-size: 16px; }
       .topbar { flex-wrap: wrap; gap: 6px; }
       .nav-btns { order: 3; width: 100%; justify-content: center; }
@@ -251,6 +251,7 @@
   <div class="topbar">
     <span class="title">ترتيل</span>
     <select id="surah-select"></select>
+    <select id="hizb-select"></select>
     <div class="nav-btns">
       <button class="nav-btn" id="prev-page" disabled>‹ السابق</button>
       <div class="page-jump">
@@ -350,6 +351,7 @@
         const res = await fetch('quran-warsh-pages.json');
         State.data = await res.json();
         populateSurahSelect();
+        populateHizbSelect();
         State.currentPage = 1;
         renderPage(1);
         document.getElementById('recite-btn').disabled = false;
@@ -373,6 +375,31 @@
             break;
           }
         }
+      });
+    }
+
+    // Hizb = half a juz (60 hizbs total). Each hizb ≈ 10 pages.
+    function hizbFromPage(pageNum) {
+      return Math.floor((pageNum - 1) * 60 / 604) + 1;
+    }
+
+    function pageFromHizb(hizbNum) {
+      return Math.floor((hizbNum - 1) * 604 / 60) + 1;
+    }
+
+    function populateHizbSelect() {
+      const sel = document.getElementById('hizb-select');
+      const opts = [];
+      for (let h = 1; h <= 60; h++) {
+        const juz = Math.ceil(h / 2);
+        const half = h % 2 === 1 ? '١' : '٢';
+        const page = pageFromHizb(h);
+        opts.push(`<option value="${h}">حزب ${h} • الجزء ${juz} • صفحة ${page}</option>`);
+      }
+      sel.innerHTML = opts.join('');
+      sel.addEventListener('change', e => {
+        const hizbNum = parseInt(e.target.value);
+        renderPage(pageFromHizb(hizbNum));
       });
     }
 
@@ -538,6 +565,7 @@
       document.getElementById('page-total').textContent = '/ ' + State.data.meta.totalPages;
       const firstAyah = pages[0].ayahs[0];
       if (firstAyah) document.getElementById('surah-select').value = firstAyah.sura;
+      document.getElementById('hizb-select').value = hizbFromPage(pageNum);
       const surahName = firstAyah ? firstAyah.suraName : '';
       if (pages.length === 2) {
         updateStatus(`صفحتا ${pages[0].page}-${pages[1].page} — ${surahName}`);
