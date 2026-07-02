@@ -245,7 +245,13 @@
   </style>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Amiri:wght@400;700&display=swap" rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"></script>
+  <script>
+    // Configure ORT WASM paths before any inference
+    if (window.ort) {
+      ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+    }
+  </script>
 </head>
 <body>
   <div class="topbar">
@@ -1077,6 +1083,7 @@
         let spokenSyllables = 0;
         let isSpeaking = false;
         let vadInferenceCount = 0;
+        let vadErrorCount = 0;
         let speechStart = 0;
         let lastSpeechTime = 0;
         let silenceStart = 0;
@@ -1176,7 +1183,19 @@
                 revealUpToWordCount(spokenSyllables, State.thresholds, State.revealState);
               }
             } catch (e) {
-              dbg('VAD inference error: ' + e.message);
+              // ORT may throw DOM errors (removeChild) due to internal script cleanup races
+              // Don't kill the loop — just log once and continue
+              if (vadErrorCount < 3) {
+                dbg('VAD inference error: ' + e.message);
+                vadErrorCount++;
+              }
+              // After 3 errors, switch to energy-based fallback
+              if (vadErrorCount === 3) {
+                dbg('VAD repeatedly failing — switching to energy-based fallback');
+                clearInterval(State.vadInterval);
+                startEnergyBasedFallback().catch(e2 => dbg('Energy fallback also failed: ' + e2.message));
+                return;
+              }
             }
           }
         }
