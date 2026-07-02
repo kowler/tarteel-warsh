@@ -489,30 +489,75 @@
     }
 
     // ============================================================
-    // Word-counting line reveal
-    // Each line has a known word count from the mushaf text data.
-    // When enough words are spoken to fill the current line, reveal it.
+    // Syllable-based line reveal
+    // Arabic syllable structure is deterministic from diacritized text.
+    // Each vowel mark (fatha, damma, kasra, tanween, superscript alef)
+    // = one syllable nucleus. We count syllables per line, and track
+    // cumulative syllable thresholds. This is more stable than word
+    // counting because it's immune to wasl (word joining).
     // ============================================================
 
-    function buildWordThresholds() {
-      const lineWordCounts = State.pageLines.map(pl => pl.words.length);
-      const cumulativeThresholds = [];
-      let cum = 0;
-      for (const wc of lineWordCounts) {
-        cum += wc;
-        cumulativeThresholds.push(cum);
+    // Arabic diacritics — Unicode code points
+    const AR_VOWELS = new Set([
+      0x064E, // Fatha
+      0x064F, // Damma
+      0x0650, // Kasra
+      0x064B, // Fathatan
+      0x064C, // Dammatan
+      0x064D, // Kasratan
+      0x0670, // Superscript Alef (Maddah)
+    ]);
+
+    const AR_LONG_VOWELS = new Set([
+      0x0627, // Alef
+      0x0648, // Waw
+      0x064A, // Ya
+      0x0649, // Alef Maqsura
+    ]);
+
+    function countSyllables(word) {
+      let count = 0;
+      const chars = [...word];
+      for (let i = 0; i < chars.length; i++) {
+        const cp = chars[i].codePointAt(0);
+        if (AR_VOWELS.has(cp)) {
+          count++;
+        } else if (AR_LONG_VOWELS.has(cp)) {
+          // Long vowel: only new syllable if not preceded by a short vowel
+          if (i > 0 && AR_VOWELS.has(chars[i-1].codePointAt(0))) {
+            // Extends existing syllable, no new one
+          } else if (i > 0 && AR_LONG_VOWELS.has(chars[i-1].codePointAt(0))) {
+            count++;
+          } else {
+            count++;
+          }
+        }
       }
-      dbg(`Word counts per line: [${lineWordCounts.join(', ')}]`);
-      dbg(`Cumulative thresholds: [${cumulativeThresholds.join(', ')}]`);
-      return { lineWordCounts, cumulativeThresholds };
+      return Math.max(1, count);
     }
 
-    function revealUpToWordCount(spokenWords, thresholds, state) {
+    // Build cumulative syllable thresholds for each line
+    function buildWordThresholds() {
+      const lineSyllableCounts = State.pageLines.map(pl =>
+        pl.words.reduce((sum, w) => sum + countSyllables(w.text), 0)
+      );
+      const cumulativeThresholds = [];
+      let cum = 0;
+      for (const sc of lineSyllableCounts) {
+        cum += sc;
+        cumulativeThresholds.push(cum);
+      }
+      dbg(`Syllable counts per line: [${lineSyllableCounts.join(', ')}]`);
+      dbg(`Cumulative syllable thresholds: [${cumulativeThresholds.join(', ')}]`);
+      return { lineSyllableCounts, cumulativeThresholds };
+    }
+
+    function revealUpToWordCount(spokenSyllables, thresholds, state) {
       while (state.nextLineToReveal < thresholds.cumulativeThresholds.length &&
-             spokenWords >= thresholds.cumulativeThresholds[state.nextLineToReveal]) {
+             spokenSyllables >= thresholds.cumulativeThresholds[state.nextLineToReveal]) {
         if (state.nextLineToReveal < State.pageLines.length) {
           revealLine(state.nextLineToReveal);
-          dbg(`Revealed line ${state.nextLineToReveal} at word ${spokenWords}/${thresholds.cumulativeThresholds[state.nextLineToReveal]}`);
+          dbg(`Revealed line ${state.nextLineToReveal} at syllable ${spokenSyllables}/${thresholds.cumulativeThresholds[state.nextLineToReveal]}`);
           State.currentLine = state.nextLineToReveal + 1;
         }
         state.nextLineToReveal++;
@@ -520,8 +565,8 @@
 
       if (State.currentLine < State.pageLines.length) {
         setActiveLine(State.currentLine);
-        const remaining = thresholds.cumulativeThresholds[State.currentLine] - spokenWords;
-        updateStatus(` السطر ${State.currentLine + 1} — بقيت ${Math.max(0, remaining)} كلمة `, 'listening');
+        const remaining = thresholds.cumulativeThresholds[State.currentLine] - spokenSyllables;
+        updateStatus(` السطر ${State.currentLine + 1} — بقيت ${Math.max(0, remaining)} مقطع `, 'listening');
       } else {
         updateStatus(' ✓ اكتملت الصفحة! ', 'listening');
       }
@@ -596,22 +641,24 @@
       recognition.continuous = true;
       recognition.interimResults = true;
 
-      let spokenWords = 0;
+      let spokenSyllables = 0;
       let speechApiWorking = false;
       let sessionOffset = 0;
       let reciteStart = Date.now();
 
-      // Quran recitation compensation:
-      // Wasl (word joining), madd, idgham cause API to undercount.
-      // Typical undercount: 25-40% in tarteel recitation.
-      const COMPENSATION = 1.45;
-      // Duration-based floor: in tarteel, ~2.0 words/sec minimum
-      const WORDS_PER_SEC = 2.0;
+      // In tarteel recitation, average ~3.4 syllables per word.
+      // Speech API transcribes words; we convert to syllables using
+      // the average ratio. This is more stable than word counting
+      // because it naturally accounts for wasl (joined words still
+      // produce the same total syllable count).
+      const SYLLABLES_PER_WORD = 3.4;
+      // Duration-based floor: in tarteel, ~7 syllables/sec
+      const SYLLABLES_PER_SEC = 7.0;
       const MIN_SPEAK_MS = 3000;
 
       recognition.onstart = () => {
         speechApiWorking = true;
-        sessionOffset = spokenWords;
+        sessionOffset = spokenSyllables;
         State.engine = 'speech-api';
         updateEngineBadge();
         dbg(`Speech API (re)started — offset=${sessionOffset}`);
@@ -625,23 +672,23 @@
           sessionWords += words.length;
         }
 
-        const compensatedSession = Math.round(sessionWords * COMPENSATION);
-        let total = sessionOffset + compensatedSession;
+        // Convert words to syllables
+        let total = sessionOffset + Math.round(sessionWords * SYLLABLES_PER_WORD);
 
         // Duration-based floor
         const elapsedSec = (Date.now() - reciteStart) / 1000;
         if (elapsedSec > MIN_SPEAK_MS / 1000) {
-          const durationFloor = Math.round(elapsedSec * WORDS_PER_SEC);
+          const durationFloor = Math.round(elapsedSec * SYLLABLES_PER_SEC);
           if (durationFloor > total) {
             dbg(`Duration floor: ${durationFloor} > speech ${total}, using floor`);
             total = durationFloor;
           }
         }
 
-        if (total > spokenWords) {
-          spokenWords = total;
-          dbg(`Words: ${spokenWords} (session=${sessionWords}, comp=${compensatedSession}, offset=${sessionOffset}, elapsed=${elapsedSec.toFixed(1)}s)`);
-          revealUpToWordCount(spokenWords, State.thresholds, State.revealState);
+        if (total > spokenSyllables) {
+          spokenSyllables = total;
+          dbg(`Syllables: ${spokenSyllables} (sessionWords=${sessionWords}, elapsed=${elapsedSec.toFixed(1)}s)`);
+          revealUpToWordCount(spokenSyllables, State.thresholds, State.revealState);
         }
       };
 
@@ -756,11 +803,18 @@
         gainNode.connect(State.audioContext.destination);
 
         // Process audio in 512-sample chunks via Silero VAD
-        let spokenWords = 0;
+        // Instead of counting speech bursts as words, we estimate syllables
+        // from total speech duration. In tarteel recitation, ~7 syllables/sec.
+        let spokenSyllables = 0;
         let isSpeaking = false;
         let speechStart = 0;
         let lastSpeechTime = 0;
         let silenceStart = 0;
+        let totalSpeechMs = 0;  // accumulate total speech duration
+        let lastUpdateSyllables = 0;
+
+        // Tarteel recitation pace: ~7 syllables per second of speech
+        const SYLLABLES_PER_SEC = 7.0;
 
         async function processVadChunk() {
           if (!State.isReciting) return;
@@ -803,6 +857,7 @@
               document.getElementById('level-fill').style.width = Math.min(100, prob * 100) + '%';
 
               const now = Date.now();
+              const chunkMs = (CHUNK_SIZE / SR) * 1000; // 32ms per chunk
 
               if (prob > SPEECH_THRESHOLD) {
                 if (!isSpeaking) {
@@ -811,22 +866,26 @@
                   silenceStart = 0;
                   dbg(`VAD: speech started (prob=${prob.toFixed(3)})`);
                 }
+                // Accumulate speech duration
+                totalSpeechMs += chunkMs;
                 lastSpeechTime = now;
               } else if (prob < SILENCE_THRESHOLD) {
                 if (isSpeaking) {
                   if (silenceStart === 0) silenceStart = now;
                   if (now - silenceStart > SILENCE_RESET_MS) {
-                    const speechDur = lastSpeechTime - speechStart;
-                    if (speechDur > MIN_SPEECH_MS) {
-                      // Count this speech burst as one word
-                      spokenWords++;
-                      dbg(`VAD: word #${spokenWords} (dur=${speechDur}ms, prob_peak=${prob.toFixed(3)})`);
-                      revealUpToWordCount(spokenWords, State.thresholds, State.revealState);
-                    }
                     isSpeaking = false;
                     silenceStart = 0;
+                    dbg(`VAD: speech ended (total speech: ${totalSpeechMs.toFixed(0)}ms)`);
                   }
                 }
+              }
+
+              // Estimate syllables from total speech duration
+              const estimatedSyllables = Math.round(totalSpeechMs / 1000 * SYLLABLES_PER_SEC);
+              if (estimatedSyllables > lastUpdateSyllables) {
+                spokenSyllables = estimatedSyllables;
+                lastUpdateSyllables = estimatedSyllables;
+                revealUpToWordCount(spokenSyllables, State.thresholds, State.revealState);
               }
             } catch (e) {
               dbg('VAD inference error: ' + e.message);
@@ -848,16 +907,17 @@
     // ── Energy-based fallback (if Silero VAD fails to load) ──
     async function startEnergyBasedFallback() {
       const dataArray = new Uint8Array(State.analyser.frequencyBinCount);
-      let spokenWords = 0;
+      let spokenSyllables = 0;
+      let totalSpeechMs = 0;
       let isSpeaking = false;
+      let speechStartMs = 0;
+      let lastUpdateSyllables = 0;
       let baseline = 0;
-      let lastPulse = 0;
       const BASELINE_DECAY = 0.995;
-      const PULSE_THRESHOLD = 1.6;
-      const PULSE_COOLDOWN_MS = 250;
       const START_THRESHOLD = 12;
       const STOP_THRESHOLD = 4;
-      const SILENCE_RESET_MS = 2000;
+      const SILENCE_RESET_MS = 600;
+      const SYLLABLES_PER_SEC = 7.0;
       let silenceStart = 0;
 
       State.engine = 'energy';
@@ -879,6 +939,7 @@
 
         if (isSpeaking) {
           baseline = baseline * BASELINE_DECAY + rms * (1 - BASELINE_DECAY);
+          totalSpeechMs += 40; // interval is 40ms
         }
 
         if (!isSpeaking) {
@@ -886,17 +947,18 @@
             isSpeaking = true;
             baseline = rms * 0.7;
             silenceStart = 0;
+            speechStartMs = now;
             updateStatus(' يرتل... ', 'listening');
           }
           return;
         }
 
-        if (rms > baseline * PULSE_THRESHOLD && rms > START_THRESHOLD &&
-            now - lastPulse > PULSE_COOLDOWN_MS) {
-          lastPulse = now;
-          spokenWords++;
-          dbg(`Pulse word #${spokenWords} (rms=${rms.toFixed(1)}, baseline=${baseline.toFixed(1)})`);
-          revealUpToWordCount(spokenWords, State.thresholds, State.revealState);
+        // Estimate syllables from speech duration
+        const estimatedSyllables = Math.round(totalSpeechMs / 1000 * SYLLABLES_PER_SEC);
+        if (estimatedSyllables > lastUpdateSyllables) {
+          spokenSyllables = estimatedSyllables;
+          lastUpdateSyllables = estimatedSyllables;
+          revealUpToWordCount(spokenSyllables, State.thresholds, State.revealState);
         }
 
         if (rms < STOP_THRESHOLD) {
