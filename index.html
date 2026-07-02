@@ -88,6 +88,34 @@
       padding: 12px 8px 160px;
     }
 
+    /* ── Spread layout (2 pages side-by-side on large screens) ── */
+    .spread {
+      display: flex;
+      gap: 4px;
+      justify-content: center;
+      align-items: flex-start;
+    }
+    .spread .mushaf-page {
+      flex: 1 1 50%;
+      max-width: 50%;
+      margin-bottom: 0;
+    }
+    @media (min-width: 1024px) {
+      .page-container {
+        max-width: 1700px;
+        padding: 12px 8px 160px;
+      }
+      .spread { gap: 6px; }
+    }
+    @media (max-width: 1023px) {
+      .spread .mushaf-page.single-mode {
+        max-width: 100%;
+      }
+      .spread .mushaf-page.right-page + .mushaf-page.left-page {
+        display: none;
+      }
+    }
+
     /* ── Mushaf page with line overlays ── */
     .mushaf-page {
       position: relative;
@@ -297,6 +325,7 @@
       adaptiveRate: 7.0,     // syllables/sec — tuned live after each line reveal
       totalSpeechMs: 0,      // accumulated speech duration (VAD/energy paths)
       syllableOverflow: 0,   // extra syllables carried to next page on auto-advance
+      pageCount: 1,          // 1 on narrow screens, 2 on wide (spread mode)
     };
 
     // ============================================================
@@ -378,68 +407,116 @@
     }
 
     // ============================================================
-    // Render page with line overlays
+    // Render page(s) with line overlays
+    // On large screens (≥1024px), shows 2 pages side-by-side (spread).
+    // Arabic reads right-to-left, so the right page is the current page
+    // and the left page is the next page.
     // ============================================================
+
+    // Detect how many pages to show based on viewport width
+    function getPageCount() {
+      return window.innerWidth >= 1024 ? 2 : 1;
+    }
+
     function renderPage(pageNum) {
-      const page = State.data.pages.find(p => p.page === pageNum);
-      if (!page) return;
+      const pageCount = getPageCount();
+      const pages = [];
+      for (let i = 0; i < pageCount; i++) {
+        const pn = pageNum + i;
+        if (pn > State.data.meta.totalPages) break;
+        const page = State.data.pages.find(p => p.page === pn);
+        if (page) pages.push(page);
+      }
+      if (pages.length === 0) return;
+
       State.currentPage = pageNum;
-      State.pageLines = buildPageLines(page);
+      State.pageCount = pages.length;
+
+      // Build combined pageLines (right page first, then left page)
+      State.pageLines = [];
+      State.segmentEls = [];
       State.currentLine = 0;
       State.allWords = [];
-      for (let li = 0; li < State.pageLines.length; li++) {
-        for (const w of State.pageLines[li].words) {
-          State.allWords.push({ text: w.text, lineIdx: li });
+
+      for (let pi = 0; pi < pages.length; pi++) {
+        const pageLines = buildPageLines(pages[pi]);
+        const lineOffset = State.pageLines.length;
+        for (let li = 0; li < pageLines.length; li++) {
+          pageLines[li]._pageIdx = pi;
+          pageLines[li]._pageNum = pages[pi].page;
+          State.pageLines.push(pageLines[li]);
+          for (const w of pageLines[li].words) {
+            State.allWords.push({ text: w.text, lineIdx: lineOffset + li });
+          }
         }
       }
 
+      // Build DOM
       const container = document.getElementById('page-container');
       container.innerHTML = '';
 
       const info = document.createElement('div');
       info.className = 'page-info';
-      info.textContent = `صفحة ${pageNum} • الجزء ${page.juz}`;
+      if (pages.length === 2) {
+        info.textContent = `صفحة ${pages[0].page}-${pages[1].page} • الجزء ${pages[0].juz}`;
+      } else {
+        info.textContent = `صفحة ${pages[0].page} • الجزء ${pages[0].juz}`;
+      }
       container.appendChild(info);
 
-      const pageDiv = document.createElement('div');
-      pageDiv.className = 'mushaf-page';
-      const img = document.createElement('img');
-      img.src = `https://raw.githubusercontent.com/QuranHub/quran-pages-images/main/kfgqpc/warsh/${pageNum}.jpg`;
-      img.alt = `مصحف ورش - صفحة ${pageNum}`;
-      img.loading = 'lazy';
+      // Create spread wrapper
+      const spread = document.createElement('div');
+      spread.className = 'spread';
 
-      // Create overlays immediately (positioned by % of image height).
-      // Every standard mushaf page has exactly 15 line positions.
-      // We map each data line to its absolute line number (1-15),
-      // so surah headers (which occupy a line position but have no
-      // text data) are naturally skipped.
-      State.segmentEls = [];  // reset before creating new segments
+      // Create overlays for each page
       const TOTAL_LINES = 15;
       const TEXT_TOP = 4.0;
       const TEXT_BOTTOM = 96.0;
       const lineH = (TEXT_BOTTOM - TEXT_TOP) / TOTAL_LINES;
       const bands = [];
       for (let i = 0; i < TOTAL_LINES; i++) {
-        bands.push({
-          top: TEXT_TOP + i * lineH,
-          bottom: TEXT_TOP + (i + 1) * lineH
-        });
+        bands.push({ top: TEXT_TOP + i * lineH, bottom: TEXT_TOP + (i + 1) * lineH });
       }
 
-      for (let i = 0; i < State.pageLines.length; i++) {
-        const lineData = State.pageLines[i];
-        const bandIdx = Math.min(lineData.lineNum - 1, TOTAL_LINES - 1);
-        const band = bands[bandIdx];
+      for (let pi = 0; pi < pages.length; pi++) {
+        const page = pages[pi];
+        const pageDiv = document.createElement('div');
+        pageDiv.className = 'mushaf-page';
+        if (pages.length === 1) pageDiv.classList.add('single-mode');
+        pageDiv.classList.add(pi === 0 ? 'right-page' : 'left-page');
 
-        const seg = document.createElement('div');
-        seg.className = 'line-segment hidden';
-        seg.style.top = band.top + '%';
-        seg.style.height = (band.bottom - band.top) + '%';
-        seg.dataset.lineIdx = i;
-        pageDiv.appendChild(seg);
-        State.segmentEls.push(seg);
+        const img = document.createElement('img');
+        img.src = `https://raw.githubusercontent.com/QuranHub/quran-pages-images/main/kfgqpc/warsh/${page.page}.jpg`;
+        img.alt = `مصحف ورش - صفحة ${page.page}`;
+        img.loading = pi === 0 ? 'eager' : 'lazy';
+
+        // Create line overlays for this page
+        const pageLines = State.pageLines.filter(pl => pl._pageIdx === pi);
+        for (let li = 0; li < pageLines.length; li++) {
+          const lineData = pageLines[li];
+          const globalIdx = State.pageLines.indexOf(lineData);
+          const bandIdx = Math.min(lineData.lineNum - 1, TOTAL_LINES - 1);
+          const band = bands[bandIdx];
+
+          const seg = document.createElement('div');
+          seg.className = 'line-segment hidden';
+          seg.style.top = band.top + '%';
+          seg.style.height = (band.bottom - band.top) + '%';
+          seg.dataset.lineIdx = globalIdx;
+          pageDiv.appendChild(seg);
+          State.segmentEls.push(seg);
+        }
+
+        img.onload = () => {
+          dbg(`Image loaded: ${img.naturalWidth}x${img.naturalHeight} (page ${page.page})`);
+        };
+
+        pageDiv.appendChild(img);
+        spread.appendChild(pageDiv);
       }
-      dbg(`Created ${State.segmentEls.length} line overlays`);
+
+      container.appendChild(spread);
+      dbg(`Created ${State.segmentEls.length} line overlays across ${pages.length} page(s)`);
 
       // If we're reciting and auto-advancing, kick off the new page
       if (State.isReciting && State._pendingAutoAdvance) {
@@ -447,24 +524,22 @@
         startRecitationEngine();
       }
 
-      img.onload = () => {
-        dbg(`Image loaded: ${img.naturalWidth}x${img.naturalHeight}`);
-      };
-
-      pageDiv.appendChild(img);
-      State.imgEl = img;
-      container.appendChild(pageDiv);
-
+      // Update nav buttons
+      const lastPage = pages[pages.length - 1].page;
       document.getElementById('prev-page').disabled = pageNum <= 1;
-      document.getElementById('next-page').disabled = pageNum >= State.data.meta.totalPages;
+      document.getElementById('next-page').disabled = lastPage >= State.data.meta.totalPages;
       const pageInput = document.getElementById('page-input');
       pageInput.value = pageNum;
       pageInput.max = State.data.meta.totalPages;
       document.getElementById('page-total').textContent = '/ ' + State.data.meta.totalPages;
-      const firstAyah = page.ayahs[0];
+      const firstAyah = pages[0].ayahs[0];
       if (firstAyah) document.getElementById('surah-select').value = firstAyah.sura;
       const surahName = firstAyah ? firstAyah.suraName : '';
-      updateStatus(`صفحة ${pageNum} — ${surahName}`);
+      if (pages.length === 2) {
+        updateStatus(`صفحتا ${pages[0].page}-${pages[1].page} — ${surahName}`);
+      } else {
+        updateStatus(`صفحة ${pages[0].page} — ${surahName}`);
+      }
     }
 
     // ============================================================
@@ -572,8 +647,11 @@
       if (autoAdvancePending) return;
       autoAdvancePending = true;
 
+      const step = State.pageCount || 1;
+      const nextPageNum = State.currentPage + step;
+
       // Check if there's a next page
-      if (State.currentPage >= State.data.meta.totalPages) {
+      if (nextPageNum > State.data.meta.totalPages) {
         updateStatus(' ✓ اكتملت الصفحة! ', 'listening');
         autoAdvancePending = false;
         return;
@@ -584,16 +662,16 @@
       const overflow = Math.max(0, spokenSyllables - lastThreshold);
       State.syllableOverflow = overflow;
 
-      dbg(`Auto-advancing to page ${State.currentPage + 1} (overflow=${overflow} syllables)`);
+      dbg(`Auto-advancing to page ${nextPageNum} (overflow=${overflow} syllables, step=${step})`);
 
       // Stop current engine without stopping recitation state
       stopRecitationEngine();
 
-      updateStatus(` ← صفحة ${State.currentPage + 1} `, 'listening');
+      updateStatus(` ← صفحة ${nextPageNum} `, 'listening');
 
-      // Render next page (this creates segments synchronously now)
+      // Render next page(s) (this creates segments synchronously now)
       State._pendingAutoAdvance = true;
-      renderPage(State.currentPage + 1);
+      renderPage(nextPageNum);
     }
 
     // Stop engine but keep isReciting true (for auto-advance)
@@ -1166,16 +1244,21 @@
     }
 
     function nextPage() {
-      if (State.currentPage < State.data.meta.totalPages) {
+      const step = State.pageCount || 1;
+      if (State.currentPage + step <= State.data.meta.totalPages) {
         stopReciting();
-        renderPage(State.currentPage + 1);
+        renderPage(State.currentPage + step);
       }
     }
 
     function prevPage() {
-      if (State.currentPage > 1) {
+      const step = State.pageCount || 1;
+      if (State.currentPage - step >= 1) {
         stopReciting();
-        renderPage(State.currentPage - 1);
+        renderPage(State.currentPage - step);
+      } else if (State.currentPage > 1) {
+        stopReciting();
+        renderPage(1);
       }
     }
 
@@ -1234,6 +1317,24 @@
         e.preventDefault();
         tapRevealNext();
       }
+    });
+
+    // Re-render on viewport resize crossing the 1024px breakpoint
+    let resizeTimer = null;
+    window.addEventListener('resize', () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        const newCount = getPageCount();
+        if (newCount !== State.pageCount) {
+          const wasReciting = State.isReciting;
+          if (wasReciting) stopReciting();
+          renderPage(State.currentPage);
+          if (wasReciting) {
+            // Restart recitation on the new layout
+            startReciting();
+          }
+        }
+      }, 300);
     });
 
     // ============================================================
