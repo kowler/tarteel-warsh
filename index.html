@@ -296,6 +296,7 @@
       engine: null,  // 'speech-api' | 'energy'
       adaptiveRate: 7.0,     // syllables/sec — tuned live after each line reveal
       totalSpeechMs: 0,      // accumulated speech duration (VAD/energy paths)
+      syllableOverflow: 0,   // extra syllables carried to next page on auto-advance
     };
 
     // ============================================================
@@ -407,46 +408,52 @@
       img.alt = `مصحف ورش - صفحة ${pageNum}`;
       img.loading = 'lazy';
 
-      // When image loads, create 15 equal-height line overlays.
+      // Create overlays immediately (positioned by % of image height).
       // Every standard mushaf page has exactly 15 line positions.
       // We map each data line to its absolute line number (1-15),
       // so surah headers (which occupy a line position but have no
       // text data) are naturally skipped.
+      State.segmentEls = [];  // reset before creating new segments
+      const TOTAL_LINES = 15;
+      const TEXT_TOP = 4.0;
+      const TEXT_BOTTOM = 96.0;
+      const lineH = (TEXT_BOTTOM - TEXT_TOP) / TOTAL_LINES;
+      const bands = [];
+      for (let i = 0; i < TOTAL_LINES; i++) {
+        bands.push({
+          top: TEXT_TOP + i * lineH,
+          bottom: TEXT_TOP + (i + 1) * lineH
+        });
+      }
+
+      for (let i = 0; i < State.pageLines.length; i++) {
+        const lineData = State.pageLines[i];
+        const bandIdx = Math.min(lineData.lineNum - 1, TOTAL_LINES - 1);
+        const band = bands[bandIdx];
+
+        const seg = document.createElement('div');
+        seg.className = 'line-segment hidden';
+        seg.style.top = band.top + '%';
+        seg.style.height = (band.bottom - band.top) + '%';
+        seg.dataset.lineIdx = i;
+        pageDiv.appendChild(seg);
+        State.segmentEls.push(seg);
+      }
+      dbg(`Created ${State.segmentEls.length} line overlays`);
+
+      // If we're reciting and auto-advancing, kick off the new page
+      if (State.isReciting && State._pendingAutoAdvance) {
+        State._pendingAutoAdvance = false;
+        startRecitationEngine();
+      }
+
       img.onload = () => {
         dbg(`Image loaded: ${img.naturalWidth}x${img.naturalHeight}`);
-
-        const TOTAL_LINES = 15;
-        const TEXT_TOP = 4.0;
-        const TEXT_BOTTOM = 96.0;
-        const lineH = (TEXT_BOTTOM - TEXT_TOP) / TOTAL_LINES;
-        const bands = [];
-        for (let i = 0; i < TOTAL_LINES; i++) {
-          bands.push({
-            top: TEXT_TOP + i * lineH,
-            bottom: TEXT_TOP + (i + 1) * lineH
-          });
-        }
-
-        for (let i = 0; i < State.pageLines.length; i++) {
-          const lineData = State.pageLines[i];
-          const bandIdx = Math.min(lineData.lineNum - 1, TOTAL_LINES - 1);
-          const band = bands[bandIdx];
-
-          const seg = document.createElement('div');
-          seg.className = 'line-segment hidden';
-          seg.style.top = band.top + '%';
-          seg.style.height = (band.bottom - band.top) + '%';
-          seg.dataset.lineIdx = i;
-          pageDiv.appendChild(seg);
-          State.segmentEls.push(seg);
-        }
-        dbg(`Created ${State.segmentEls.length} line overlays`);
       };
 
       pageDiv.appendChild(img);
       State.imgEl = img;
       container.appendChild(pageDiv);
-      State.segmentEls = [];
 
       document.getElementById('prev-page').disabled = pageNum <= 1;
       document.getElementById('next-page').disabled = pageNum >= State.data.meta.totalPages;
@@ -554,6 +561,59 @@
       return { lineSyllableCounts, cumulativeThresholds };
     }
 
+    // ============================================================
+    // Auto-advance: when all lines on current page are revealed,
+    // advance to next page and continue reciting seamlessly.
+    // ============================================================
+    let autoAdvancePending = false;
+
+    function autoAdvancePage(spokenSyllables, thresholds) {
+      // Avoid double-trigger
+      if (autoAdvancePending) return;
+      autoAdvancePending = true;
+
+      // Check if there's a next page
+      if (State.currentPage >= State.data.meta.totalPages) {
+        updateStatus(' ✓ اكتملت الصفحة! ', 'listening');
+        autoAdvancePending = false;
+        return;
+      }
+
+      // Calculate overflow: syllables spoken beyond the last line's threshold
+      const lastThreshold = thresholds.cumulativeThresholds[thresholds.cumulativeThresholds.length - 1];
+      const overflow = Math.max(0, spokenSyllables - lastThreshold);
+      State.syllableOverflow = overflow;
+
+      dbg(`Auto-advancing to page ${State.currentPage + 1} (overflow=${overflow} syllables)`);
+
+      // Stop current engine without stopping recitation state
+      stopRecitationEngine();
+
+      updateStatus(` ← صفحة ${State.currentPage + 1} `, 'listening');
+
+      // Render next page (this creates segments synchronously now)
+      State._pendingAutoAdvance = true;
+      renderPage(State.currentPage + 1);
+    }
+
+    // Stop engine but keep isReciting true (for auto-advance)
+    function stopRecitationEngine() {
+      if (State.speechRecognition) {
+        try { State.speechRecognition.stop(); } catch (e) {}
+        State.speechRecognition = null;
+      }
+      if (State.vadInterval) { clearInterval(State.vadInterval); State.vadInterval = null; }
+      if (State.mediaStream) { State.mediaStream.getTracks().forEach(t => t.stop()); State.mediaStream = null; }
+      if (State.audioContext) {
+        try { State.audioContext.close(); } catch(e) {}
+        State.audioContext = null;
+      }
+      State.analyser = null;
+      State.engine = null;
+      updateEngineBadge();
+      document.getElementById('level-fill').style.width = '0%';
+    }
+
     function revealUpToWordCount(spokenSyllables, thresholds, state) {
       while (state.nextLineToReveal < thresholds.cumulativeThresholds.length &&
              spokenSyllables >= thresholds.cumulativeThresholds[state.nextLineToReveal]) {
@@ -580,7 +640,8 @@
         const rateInfo = State.totalSpeechMs > 1000 ? ` • ${State.adaptiveRate.toFixed(1)} م/ث` : '';
         updateStatus(` السطر ${State.currentLine + 1} — بقيت ${Math.max(0, remaining)} مقطع${rateInfo} `, 'listening');
       } else {
-        updateStatus(' ✓ اكتملت الصفحة! ', 'listening');
+        // Page complete — auto-advance to next page
+        autoAdvancePage(spokenSyllables, thresholds);
       }
     }
 
@@ -600,6 +661,7 @@
       State.revealState = { nextLineToReveal: 0 };
       State.adaptiveRate = 7.0;   // reset to default each session
       State.totalSpeechMs = 0;
+      State.syllableOverflow = 0; // carry extra syllables across pages
 
       // Step 1: Request mic permission via getUserMedia().
       // This triggers the browser's mic permission prompt — essential
@@ -625,14 +687,40 @@
         return;
       }
 
-      // Step 2: Try Web Speech API (Chrome, Edge, Safari — all platforms).
-      // Now that mic permission is granted, Speech API should work.
+      startRecitationEngine();
+    }
+
+    // Engine selector — called on first start and on auto-advance.
+    // Assumes mic permission is already granted and State.mediaStream
+    // is available (or was released for Speech API).
+    async function startRecitationEngine() {
+      // Reset auto-advance guard
+      autoAdvancePending = false;
+
+      // Save accumulated speech duration for adaptive rate continuity
+      const savedSpeechMs = State.totalSpeechMs;
+      State._pageSpeechOffset = savedSpeechMs;
+
+      // Build thresholds for the current page
+      State.thresholds = buildWordThresholds();
+      State.revealState = { nextLineToReveal: 0 };
+      setActiveLine(State.currentLine);
+
+      // If we have overflow syllables from the previous page, apply them
+      if (State.syllableOverflow > 0) {
+        dbg(`Applying ${State.syllableOverflow} overflow syllables to new page`);
+        revealUpToWordCount(State.syllableOverflow, State.thresholds, State.revealState);
+      }
+
+      // Try Web Speech API (Chrome, Edge, Safari — all platforms).
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
       if (SpeechRecognition) {
         dbg('Web Speech API available — trying it');
         // Release the getUserMedia stream — Speech API manages its own mic
-        State.mediaStream.getTracks().forEach(t => t.stop());
-        State.mediaStream = null;
+        if (State.mediaStream) {
+          State.mediaStream.getTracks().forEach(t => t.stop());
+          State.mediaStream = null;
+        }
         try {
           startSpeechApiCounting(SpeechRecognition);
           return;
@@ -643,8 +731,26 @@
         dbg('Web Speech API not available — using energy-based counting');
       }
 
-      // Step 3: Fallback — energy-based syllable counting.
-      // Re-acquire the mic stream (permission already granted).
+      // Fallback — Silero VAD / energy-based counting.
+      // Need to re-acquire mic stream if we don't have one
+      if (!State.mediaStream) {
+        try {
+          State.mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              channelCount: 1,
+              sampleRate: 16000,
+              echoCancellation: true,
+              noiseSuppression: true,
+            }
+          });
+        } catch (e) {
+          dbg('Mic re-acquire failed: ' + e.message);
+          updateStatus(' فشل الميكروفون: ' + e.message, 'error');
+          State.isReciting = false;
+          updateReciteButton();
+          return;
+        }
+      }
       await startEnergyBasedCounting();
     }
 
@@ -659,6 +765,7 @@
       let speechApiWorking = false;
       let sessionOffset = 0;
       let reciteStart = Date.now();
+      let pageSpeechOffset = State._pageSpeechOffset || 0;
 
       // In tarteel recitation, average ~3.4 syllables per word.
       // Speech API transcribes words; we convert to syllables using
@@ -684,7 +791,7 @@
         }
 
         // Track speech duration for adaptive rate
-        State.totalSpeechMs = Date.now() - reciteStart;
+        State.totalSpeechMs = (Date.now() - reciteStart) + pageSpeechOffset;
 
         // Convert words to syllables
         let total = sessionOffset + Math.round(sessionWords * SYLLABLES_PER_WORD);
@@ -824,8 +931,9 @@
         let speechStart = 0;
         let lastSpeechTime = 0;
         let silenceStart = 0;
-        let totalSpeechMs = 0;  // accumulate total speech duration (also in State)
+        let totalSpeechMs = 0;  // local speech duration for this engine session
         let lastUpdateSyllables = 0;
+        let pageSpeechOffset = State._pageSpeechOffset || 0;  // speech ms from previous pages
 
         // Tarteel recitation pace: starts at 7 syl/sec, adapted live
         const SYLLABLES_PER_SEC = 7.0;
@@ -882,7 +990,7 @@
                 }
                 // Accumulate speech duration
                 totalSpeechMs += chunkMs;
-                State.totalSpeechMs = totalSpeechMs;
+                State.totalSpeechMs = totalSpeechMs + pageSpeechOffset;
                 lastSpeechTime = now;
               } else if (prob < SILENCE_THRESHOLD) {
                 if (isSpeaking) {
@@ -924,6 +1032,7 @@
       const dataArray = new Uint8Array(State.analyser.frequencyBinCount);
       let spokenSyllables = 0;
       let totalSpeechMs = 0;
+      let pageSpeechOffset = State._pageSpeechOffset || 0;  // speech ms from previous pages
       let isSpeaking = false;
       let speechStartMs = 0;
       let lastUpdateSyllables = 0;
@@ -955,6 +1064,7 @@
         if (isSpeaking) {
           baseline = baseline * BASELINE_DECAY + rms * (1 - BASELINE_DECAY);
           totalSpeechMs += 40; // interval is 40ms
+          State.totalSpeechMs = totalSpeechMs + pageSpeechOffset;
         }
 
         if (!isSpeaking) {
@@ -995,6 +1105,8 @@
     // ============================================================
     function stopReciting() {
       State.isReciting = false;
+      autoAdvancePending = false;
+      State._pendingAutoAdvance = false;
       if (State.speechRecognition) {
         try { State.speechRecognition.stop(); } catch (e) {}
         State.speechRecognition = null;
