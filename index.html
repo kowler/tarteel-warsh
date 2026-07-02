@@ -926,9 +926,12 @@
       recognition.onerror = (e) => {
         dbg('Speech API error: ' + e.error);
         if (e.error === 'no-speech' || e.error === 'aborted') return;
-        // On fatal errors, fall back to energy-based
-        if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
-          dbg('Speech API not allowed — falling back to energy-based');
+        // On fatal errors, fall back to VAD/energy-based counting
+        if (e.error === 'not-allowed' || e.error === 'service-not-allowed' ||
+            e.error === 'network' || e.error === 'audio-capture' ||
+            e.error === 'service-not-found' || e.error === 'bad-grammar') {
+          dbg(`Speech API fatal error (${e.error}) — falling back to VAD/energy`);
+          speechApiWorking = false;  // prevent onend restart loop
           try { recognition.stop(); } catch (err) {}
           State.speechRecognition = null;
           startEnergyBasedCounting();
@@ -936,9 +939,14 @@
       };
 
       recognition.onend = () => {
-        if (State.isReciting && speechApiWorking) {
+        if (State.isReciting && speechApiWorking && State.engine === 'speech-api') {
           dbg('Speech API ended, restarting...');
           try { recognition.start(); } catch (e) { dbg('Restart failed: ' + e.message); }
+        } else if (State.isReciting && !speechApiWorking) {
+          dbg('Speech API ended (not working) — ensuring fallback');
+          if (State.engine !== 'silero-vad' && State.engine !== 'energy') {
+            startEnergyBasedCounting();
+          }
         }
       };
 
