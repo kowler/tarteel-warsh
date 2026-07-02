@@ -294,6 +294,8 @@
       thresholds: null,
       revealState: null,
       engine: null,  // 'speech-api' | 'energy'
+      adaptiveRate: 7.0,     // syllables/sec — tuned live after each line reveal
+      totalSpeechMs: 0,      // accumulated speech duration (VAD/energy paths)
     };
 
     // ============================================================
@@ -563,10 +565,20 @@
         state.nextLineToReveal++;
       }
 
+      // ── Adaptive rate: after revealing a line, measure actual syl/sec ──
+      if (State.totalSpeechMs > 1000 && state.nextLineToReveal > 1) {
+        const actualRate = spokenSyllables / (State.totalSpeechMs / 1000);
+        // Smooth: weight old rate 60%, new measurement 40%
+        State.adaptiveRate = State.adaptiveRate * 0.6 + actualRate * 0.4;
+        State.adaptiveRate = Math.max(3.0, Math.min(15.0, State.adaptiveRate));
+        dbg(`Adaptive rate: ${State.adaptiveRate.toFixed(2)} syl/sec (measured ${actualRate.toFixed(2)})`);
+      }
+
       if (State.currentLine < State.pageLines.length) {
         setActiveLine(State.currentLine);
         const remaining = thresholds.cumulativeThresholds[State.currentLine] - spokenSyllables;
-        updateStatus(` السطر ${State.currentLine + 1} — بقيت ${Math.max(0, remaining)} مقطع `, 'listening');
+        const rateInfo = State.totalSpeechMs > 1000 ? ` • ${State.adaptiveRate.toFixed(1)} م/ث` : '';
+        updateStatus(` السطر ${State.currentLine + 1} — بقيت ${Math.max(0, remaining)} مقطع${rateInfo} `, 'listening');
       } else {
         updateStatus(' ✓ اكتملت الصفحة! ', 'listening');
       }
@@ -586,6 +598,8 @@
       // Build word thresholds for this page
       State.thresholds = buildWordThresholds();
       State.revealState = { nextLineToReveal: 0 };
+      State.adaptiveRate = 7.0;   // reset to default each session
+      State.totalSpeechMs = 0;
 
       // Step 1: Request mic permission via getUserMedia().
       // This triggers the browser's mic permission prompt — essential
@@ -652,9 +666,6 @@
       // because it naturally accounts for wasl (joined words still
       // produce the same total syllable count).
       const SYLLABLES_PER_WORD = 3.4;
-      // Duration-based floor: in tarteel, ~7 syllables/sec
-      const SYLLABLES_PER_SEC = 7.0;
-      const MIN_SPEAK_MS = 3000;
 
       recognition.onstart = () => {
         speechApiWorking = true;
@@ -672,13 +683,16 @@
           sessionWords += words.length;
         }
 
+        // Track speech duration for adaptive rate
+        State.totalSpeechMs = Date.now() - reciteStart;
+
         // Convert words to syllables
         let total = sessionOffset + Math.round(sessionWords * SYLLABLES_PER_WORD);
 
-        // Duration-based floor
+        // Duration-based floor using adaptive rate
         const elapsedSec = (Date.now() - reciteStart) / 1000;
-        if (elapsedSec > MIN_SPEAK_MS / 1000) {
-          const durationFloor = Math.round(elapsedSec * SYLLABLES_PER_SEC);
+        if (elapsedSec > 3) {
+          const durationFloor = Math.round(elapsedSec * State.adaptiveRate);
           if (durationFloor > total) {
             dbg(`Duration floor: ${durationFloor} > speech ${total}, using floor`);
             total = durationFloor;
@@ -810,10 +824,10 @@
         let speechStart = 0;
         let lastSpeechTime = 0;
         let silenceStart = 0;
-        let totalSpeechMs = 0;  // accumulate total speech duration
+        let totalSpeechMs = 0;  // accumulate total speech duration (also in State)
         let lastUpdateSyllables = 0;
 
-        // Tarteel recitation pace: ~7 syllables per second of speech
+        // Tarteel recitation pace: starts at 7 syl/sec, adapted live
         const SYLLABLES_PER_SEC = 7.0;
 
         async function processVadChunk() {
@@ -868,6 +882,7 @@
                 }
                 // Accumulate speech duration
                 totalSpeechMs += chunkMs;
+                State.totalSpeechMs = totalSpeechMs;
                 lastSpeechTime = now;
               } else if (prob < SILENCE_THRESHOLD) {
                 if (isSpeaking) {
@@ -880,8 +895,8 @@
                 }
               }
 
-              // Estimate syllables from total speech duration
-              const estimatedSyllables = Math.round(totalSpeechMs / 1000 * SYLLABLES_PER_SEC);
+              // Estimate syllables from total speech duration using adaptive rate
+              const estimatedSyllables = Math.round(totalSpeechMs / 1000 * State.adaptiveRate);
               if (estimatedSyllables > lastUpdateSyllables) {
                 spokenSyllables = estimatedSyllables;
                 lastUpdateSyllables = estimatedSyllables;
@@ -954,7 +969,7 @@
         }
 
         // Estimate syllables from speech duration
-        const estimatedSyllables = Math.round(totalSpeechMs / 1000 * SYLLABLES_PER_SEC);
+        const estimatedSyllables = Math.round(totalSpeechMs / 1000 * State.adaptiveRate);
         if (estimatedSyllables > lastUpdateSyllables) {
           spokenSyllables = estimatedSyllables;
           lastUpdateSyllables = estimatedSyllables;
@@ -1053,6 +1068,20 @@
     }
 
     // ============================================================
+    // Manual line reveal (tap to reveal)
+    // ============================================================
+    function tapRevealNext() {
+      if (!State.thresholds) return;
+      const idx = State.revealState.nextLineToReveal;
+      if (idx < State.pageLines.length) {
+        // Jump the syllable counter forward to this line's threshold
+        const targetSyl = State.thresholds.cumulativeThresholds[idx];
+        revealUpToWordCount(targetSyl, State.thresholds, State.revealState);
+        dbg(`Tap-revealed line ${idx} (forced syllables=${targetSyl})`);
+      }
+    }
+
+    // ============================================================
     // Event listeners
     // ============================================================
     document.getElementById('recite-btn').addEventListener('click', () => {
@@ -1080,10 +1109,19 @@
       document.getElementById('debug-panel').classList.toggle('visible');
     });
 
+    // Tap-to-reveal: tap on the mushaf page to reveal the next line
+    document.getElementById('page-container').addEventListener('click', () => {
+      tapRevealNext();
+    });
+
     document.addEventListener('keydown', e => {
       if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
       if (e.key === 'ArrowLeft') nextPage();
       if (e.key === 'ArrowRight') prevPage();
+      if (e.key === ' ' || e.key === 'Enter') {
+        e.preventDefault();
+        tapRevealNext();
+      }
     });
 
     // ============================================================
