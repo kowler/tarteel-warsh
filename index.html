@@ -937,7 +937,17 @@
           speechApiWorking = false;
           try { recognition.stop(); } catch (err) {}
           State.speechRecognition = null;
-          startEnergyBasedCounting();
+          dbg('Starting VAD fallback...');
+          startEnergyBasedCounting().catch(e => {
+            dbg('VAD fallback failed: ' + e.message);
+            dbg('Trying energy-based fallback...');
+            startEnergyBasedFallback().catch(e2 => {
+              dbg('All engines failed: ' + e2.message);
+              updateStatus(' فشل تشغيل الميكروفون', 'error');
+              State.isReciting = false;
+              updateReciteButton();
+            });
+          });
         }
       };
 
@@ -955,11 +965,12 @@
 
       // Give it 3 seconds — if no onstart, fall back
       setTimeout(() => {
-        if (!speechApiWorking && State.isReciting && State.engine !== 'speech-api') {
-          dbg('Speech API did not start in 3s — falling back to energy-based');
+        if (!speechApiWorking && State.isReciting && State.engine !== 'speech-api' && !speechApiAbandoned) {
+          dbg('Speech API did not start in 3s — falling back to VAD');
+          speechApiAbandoned = true;
           try { recognition.stop(); } catch (e) {}
           State.speechRecognition = null;
-          startEnergyBasedCounting();
+          startEnergyBasedCounting().catch(e => dbg('VAD fallback (3s) failed: ' + e.message));
         }
       }, 3000);
     }
@@ -1147,6 +1158,31 @@
 
     // ── Energy-based fallback (if Silero VAD fails to load) ──
     async function startEnergyBasedFallback() {
+      // Ensure we have mic + analyser (might not be set if VAD path failed early)
+      if (!State.mediaStream) {
+        dbg('Energy fallback: requesting mic...');
+        State.mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            sampleRate: 16000,
+            echoCancellation: true,
+            noiseSuppression: true,
+          }
+        });
+      }
+      if (!State.audioContext) {
+        State.audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+        if (State.audioContext.state === 'suspended') await State.audioContext.resume();
+      }
+      if (!State.analyser) {
+        const source = State.audioContext.createMediaStreamSource(State.mediaStream);
+        State.analyser = State.audioContext.createAnalyser();
+        State.analyser.fftSize = 512;
+        State.analyser.smoothingTimeConstant = 0.3;
+        source.connect(State.analyser);
+      }
+
+      dbg('Energy-based fallback ready');
       const dataArray = new Uint8Array(State.analyser.frequencyBinCount);
       let spokenSyllables = 0;
       let totalSpeechMs = 0;
