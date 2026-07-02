@@ -1019,6 +1019,7 @@
 
         // Load Silero VAD ONNX model
         let vadSession = null;
+        let vadFailed = false;
         try {
           dbg('Loading Silero VAD model...');
           vadSession = await ort.InferenceSession.create('silero_vad.onnx', {
@@ -1183,19 +1184,13 @@
                 revealUpToWordCount(spokenSyllables, State.thresholds, State.revealState);
               }
             } catch (e) {
-              // ORT may throw DOM errors (removeChild) due to internal script cleanup races
-              // Don't kill the loop — just log once and continue
-              if (vadErrorCount < 3) {
-                dbg('VAD inference error: ' + e.message);
-                vadErrorCount++;
-              }
-              // After 3 errors, switch to energy-based fallback
-              if (vadErrorCount === 3) {
-                dbg('VAD repeatedly failing — switching to energy-based fallback');
-                clearInterval(State.vadInterval);
-                startEnergyBasedFallback().catch(e2 => dbg('Energy fallback also failed: ' + e2.message));
-                return;
-              }
+              // ORT throws 'removeChild' DOM errors due to internal script cleanup races.
+              // This is a known ORT Web bug. Switch to energy-based immediately.
+              dbg('VAD inference error: ' + e.message + ' — switching to energy-based');
+              vadFailed = true;
+              clearInterval(State.vadInterval);
+              startEnergyBasedFallback().catch(e2 => dbg('Energy fallback also failed: ' + e2.message));
+              return;
             }
           }
         }
