@@ -470,8 +470,12 @@
 
       // Create overlays for each page
       const TOTAL_LINES = 15;
-      const TEXT_TOP = 4.0;
-      const TEXT_BOTTOM = 96.0;
+      // Text line positions — calibrated from actual mushaf image analysis.
+      // Standard pages (912×1345): text spans ~5.9% to ~93.8% of image height.
+      // Pages 1-2 (1039×1407, decorative frame): text spans ~6.5% to ~93.5%.
+      // Using values that work across all page sizes.
+      const TEXT_TOP = 5.9;
+      const TEXT_BOTTOM = 93.8;
       const lineH = (TEXT_BOTTOM - TEXT_TOP) / TOTAL_LINES;
       const bands = [];
       for (let i = 0; i < TOTAL_LINES; i++) {
