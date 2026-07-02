@@ -999,6 +999,7 @@
         if (State.audioContext.state === 'suspended') {
           await State.audioContext.resume();
         }
+        dbg(`AudioContext sampleRate: ${State.audioContext.sampleRate} (requested 16000)`);
 
         const source = State.audioContext.createMediaStreamSource(State.mediaStream);
         State.analyser = State.audioContext.createAnalyser();
@@ -1037,13 +1038,31 @@
         const BUFFER_SIZE = 4096;
         const scriptProcessor = State.audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
         let audioBuffer = [];
+        let chunkCount = 0;
 
         scriptProcessor.onaudioprocess = (e) => {
           if (!State.isReciting) return;
           const input = e.inputBuffer.getChannelData(0);
-          const copy = new Float32Array(input.length);
-          copy.set(input);
+          // Resample to 16kHz if AudioContext isn't 16kHz
+          const ctxRate = State.audioContext.sampleRate;
+          let copy;
+          if (ctxRate !== 16000) {
+            const ratio = 16000 / ctxRate;
+            const outLen = Math.floor(input.length * ratio);
+            copy = new Float32Array(outLen);
+            for (let i = 0; i < outLen; i++) {
+              const srcIdx = Math.floor(i / ratio);
+              copy[i] = input[srcIdx];
+            }
+          } else {
+            copy = new Float32Array(input.length);
+            copy.set(input);
+          }
           audioBuffer.push(copy);
+          chunkCount++;
+          if (chunkCount === 1) {
+            dbg(`First audio chunk received: ${copy.length} samples, rate=${ctxRate}Hz → resampled to ${copy.length} samples`);
+          }
         };
 
         const gainNode = State.audioContext.createGain();
@@ -1057,6 +1076,7 @@
         // from total speech duration. In tarteel recitation, ~7 syllables/sec.
         let spokenSyllables = 0;
         let isSpeaking = false;
+        let vadInferenceCount = 0;
         let speechStart = 0;
         let lastSpeechTime = 0;
         let silenceStart = 0;
@@ -1087,6 +1107,13 @@
           for (let i = 0; i < numChunks; i++) {
             const chunk = flat.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
 
+            // Check if chunk has signal (not silence)
+            let maxAmp = 0;
+            for (let s = 0; s < chunk.length; s++) {
+              const abs = Math.abs(chunk[s]);
+              if (abs > maxAmp) maxAmp = abs;
+            }
+
             // Run VAD inference
             const inputTensor = new ort.Tensor('float32', chunk, [1, CHUNK_SIZE]);
             const stateTensor = new ort.Tensor('float32', vadState, [2, 1, 128]);
@@ -1103,6 +1130,15 @@
               const output = results[vadSession.outputNames[0]];
               const prob = output.data[0];
               vadState = results[vadSession.outputNames[1]].data;
+
+              // Log first few chunks for diagnostics
+              if (vadInferenceCount < 5) {
+                dbg(`VAD chunk ${vadInferenceCount}: prob=${prob.toFixed(3)} maxAmp=${maxAmp.toFixed(4)}`);
+                vadInferenceCount++;
+              } else if (vadInferenceCount === 5) {
+                dbg(`VAD running — stopping verbose logs (prob=${prob.toFixed(3)})`);
+                vadInferenceCount++;
+              }
 
               // Update level meter
               document.getElementById('level-fill').style.width = Math.min(100, prob * 100) + '%';
