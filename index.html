@@ -873,6 +873,7 @@
 
       let spokenSyllables = 0;
       let speechApiWorking = false;
+      let speechApiAbandoned = false;  // hard stop — set on fatal error, never reset
       let sessionOffset = 0;
       let reciteStart = Date.now();
       let pageSpeechOffset = State._pageSpeechOffset || 0;
@@ -927,11 +928,13 @@
         dbg('Speech API error: ' + e.error);
         if (e.error === 'no-speech' || e.error === 'aborted') return;
         // On fatal errors, fall back to VAD/energy-based counting
+        if (speechApiAbandoned) return;  // already handled
         if (e.error === 'not-allowed' || e.error === 'service-not-allowed' ||
             e.error === 'network' || e.error === 'audio-capture' ||
             e.error === 'service-not-found' || e.error === 'bad-grammar') {
           dbg(`Speech API fatal error (${e.error}) — falling back to VAD/energy`);
-          speechApiWorking = false;  // prevent onend restart loop
+          speechApiAbandoned = true;
+          speechApiWorking = false;
           try { recognition.stop(); } catch (err) {}
           State.speechRecognition = null;
           startEnergyBasedCounting();
@@ -939,14 +942,11 @@
       };
 
       recognition.onend = () => {
+        // Hard stop: never restart after a fatal error
+        if (speechApiAbandoned) return;
         if (State.isReciting && speechApiWorking && State.engine === 'speech-api') {
           dbg('Speech API ended, restarting...');
           try { recognition.start(); } catch (e) { dbg('Restart failed: ' + e.message); }
-        } else if (State.isReciting && !speechApiWorking) {
-          dbg('Speech API ended (not working) — ensuring fallback');
-          if (State.engine !== 'silero-vad' && State.engine !== 'energy') {
-            startEnergyBasedCounting();
-          }
         }
       };
 
