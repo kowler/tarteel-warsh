@@ -353,6 +353,7 @@
       whisperAudioBuffer: [],
       lastTranscription: '',
       lastTranscriptionStable: false,
+      energyInterval: null,    // energy-based fallback interval
       pageWordList: [],       // flat array of normalized words for current page(s)
       lineWordRanges: [],     // [{start, end}] per line — word indices into pageWordList
       currentWordIdx: 0,      // how many words have been matched
@@ -852,6 +853,7 @@
       let wordPtr = State.currentWordIdx;
       const mistakes = [];
       let matchedCount = 0;
+      let unmatchedCount = 0;
 
       for (const recWord of recognizedWords) {
         if (wordPtr >= State.pageWordList.length) break;
@@ -878,7 +880,21 @@
             break;
           }
         }
-        // If no match found, the word is unexpected — but don't advance pointer
+        // If no match found, the recited word is wrong/unexpected
+        if (!found) {
+          unmatchedCount++;
+          // After 2+ consecutive unmatched words, mark current line as mistake
+          if (unmatchedCount >= 2) {
+            // Find which line the current wordPtr belongs to
+            for (let li = 0; li < State.lineWordRanges.length; li++) {
+              const r = State.lineWordRanges[li];
+              if (wordPtr >= r.start && wordPtr < r.end) {
+                mistakes.push(li);
+                break;
+              }
+            }
+          }
+        }
       }
 
       // Determine current line based on wordPtr
@@ -892,6 +908,9 @@
         if (wordPtr >= r.end) newLine = li + 1;
       }
 
+      if (unmatchedCount > 0) {
+        dbg(`alignWords: ${matchedCount} matched, ${unmatchedCount} unmatched, ${mistakes.length} mistakes`);
+      }
       return { matchedCount, newLine, mistakes, newWordIdx: wordPtr };
     }
 
@@ -927,7 +946,7 @@
             State.whisperReady = true;
             dbg('Whisper model ready!');
             if (State.isReciting) {
-              startWhisperAudioCapture();
+              switchToWhisperEngine();
             }
           } else if (msg.type === 'transcription') {
             handleWhisperTranscription(msg);
@@ -943,22 +962,52 @@
       }
     }
 
+    // Switch from fallback engine to Whisper — stop old engine first
+    async function switchToWhisperEngine() {
+      dbg('Switching to Whisper engine...');
+      // Stop Speech API if running
+      if (State.speechRecognition) {
+        try { State.speechRecognition.stop(); } catch (e) {}
+        State.speechRecognition = null;
+        State.speechApiAbandoned = true; // prevent restart
+      }
+      // Stop VAD/energy interval if running (energy engine also uses vadInterval)
+      if (State.vadInterval) {
+        clearInterval(State.vadInterval);
+        State.vadInterval = null;
+      }
+      // Stop energy interval if separately set
+      if (State.energyInterval) {
+        clearInterval(State.energyInterval);
+        State.energyInterval = null;
+      }
+      State.engine = 'whisper';
+      updateEngineBadge();
+      await startWhisperAudioCapture();
+    }
+
     async function startWhisperAudioCapture() {
       try {
-        const audioCtx = new AudioContext();
-        State.audioContext = audioCtx;
-        await audioCtx.audioWorklet.addModule('audio-processor.js');
-        const source = audioCtx.createMediaStreamSource(State.mediaStream);
-        const node = new AudioWorkletNode(audioCtx, 'audio-stream-processor');
+        // Reuse existing AudioContext or create new one
+        if (!State.audioContext || State.audioContext.state === 'closed') {
+          State.audioContext = new AudioContext();
+        }
+        if (State.audioContext.state === 'suspended') {
+          await State.audioContext.resume();
+        }
+        await State.audioContext.audioWorklet.addModule('audio-processor.js');
+        const source = State.audioContext.createMediaStreamSource(State.mediaStream);
+        const node = new AudioWorkletNode(State.audioContext, 'audio-stream-processor');
         State.audioWorkletNode = node;
         node.port.onmessage = (e) => {
           if (!State.isReciting || !State.whisperReady) return;
           const samples = new Float32Array(e.data);
-          // Send to Whisper worker for inference
+          // Send to Whisper worker for inference (transferable, zero-copy)
           State.whisperWorker.postMessage({ type: 'audio', samples }, [samples.buffer]);
         };
         source.connect(node);
         dbg('AudioWorklet connected to Whisper worker');
+        updateStatus(' يستمع (Whisper) ', 'listening');
       } catch (e) {
         dbg('AudioWorklet failed: ' + e.message + ' — falling back to Speech API');
         // Fall back to old engine
@@ -969,23 +1018,63 @@
     function handleWhisperTranscription(msg) {
       if (!State.isReciting) return;
       const text = msg.text.trim();
-      if (!text) return;
+      if (!text) {
+        dbg('Whisper: empty transcription, skipping');
+        return;
+      }
 
-      // Decode stability gate (from Tilawa): don't reveal lines until
-      // transcription stabilizes (≥70% similar to previous)
+      dbg(`Whisper transcribed: "${text.substring(0, 60)}${text.length > 60 ? '...' : ''}"`);
+
+      // Decode stability gate (from Tilawa): if the transcription is very
+      // different from the previous one, it might be an unstable decode.
+      // But since we accumulate audio, the full text will always grow.
+      // So we only compare the LAST N words to check stability of the latest portion.
       if (State.lastTranscription) {
+        // Extract the new portion (text after the last known good transcription)
+        const prevWords = normalizeArabic(State.lastTranscription).split(' ').filter(Boolean);
+        const currWords = normalizeArabic(text).split(' ').filter(Boolean);
+        // If current starts with most of previous, extract the new tail
+        if (currWords.length > prevWords.length) {
+          const overlap = prevWords.filter((w, i) => currWords[i] === w).length;
+          const overlapRatio = overlap / prevWords.length;
+          if (overlapRatio > 0.5) {
+            // Good overlap — extract new words
+            const newWords = currWords.slice(prevWords.length);
+            if (newWords.length === 0) {
+              dbg('Whisper: no new words since last transcription');
+              return;
+            }
+            // Only align the new portion
+            const newText = newWords.join(' ');
+            const result = alignWords(newText);
+            processAlignment(result, text);
+            State.lastTranscription = text;
+            return;
+          }
+        }
+        // Low overlap — transcription changed significantly (unstable decode)
+        // Use a lower threshold: only skip if it's wildly different
         const stability = levenshteinRatio(text, State.lastTranscription);
-        if (stability < 0.70) {
-          dbg(`Whisper: transcription unstable (${(stability*100).toFixed(0)}%) — waiting...`);
+        if (stability < 0.30) {
+          dbg(`Whisper: transcription very unstable (${(stability*100).toFixed(0)}%) — skipping`);
           State.lastTranscription = text;
           return;
         }
       }
+
       State.lastTranscription = text;
 
       // Align recognized words against expected page text
       const result = alignWords(text);
-      if (result.matchedCount === 0) return;
+      processAlignment(result, text);
+    }
+
+    // Process alignment result — reveal lines, mark mistakes
+    function processAlignment(result, fullText) {
+      if (result.matchedCount === 0) {
+        dbg('Whisper: no words matched page text');
+        return;
+      }
 
       // Mark mistakes
       for (const lineIdx of result.mistakes) {
@@ -1068,17 +1157,20 @@
         return;
       }
 
-      // Try Whisper engine first, fall back to old engines
+      // Try Whisper engine first — load model, show loading status
+      // The old syllable/speech engine will NOT run while Whisper loads.
+      // When Whisper becomes ready, it takes over automatically.
+      // If Whisper fails to load, fall back to old engine.
       if (!State.whisperReady) {
-        dbg('Whisper not ready — initializing (will fall back to Speech API meanwhile)...');
+        dbg('Whisper not ready — initializing...');
+        updateStatus(' تحميل النموذج... ', 'loading');
         initWhisperWorker();
-      }
-      // Always start with old engine as fallback while Whisper loads
-      startRecitationEngine();
-      // If Whisper is already ready, switch to it
-      if (State.whisperReady) {
+        // Start old engine as temporary fallback — will be replaced when Whisper is ready
+        dbg('Starting syllable engine as temporary fallback while Whisper loads...');
+        startRecitationEngine();
+      } else {
+        // Whisper already loaded — use it directly
         dbg('Whisper ready — starting audio capture');
-        // Stop fallback engine
         if (State.speechRecognition) {
           try { State.speechRecognition.stop(); } catch (e) {}
           State.speechRecognition = null;
@@ -1644,9 +1736,13 @@
       }
       if (State.vadInterval) { clearInterval(State.vadInterval); State.vadInterval = null; }
       if (State.audioWorkletNode) { State.audioWorkletNode.disconnect(); State.audioWorkletNode = null; }
+      if (State.whisperWorker && State.whisperReady) {
+        State.whisperWorker.postMessage({ type: 'reset' });
+      }
       if (State.mediaStream) { State.mediaStream.getTracks().forEach(t => t.stop()); State.mediaStream = null; }
       if (State.audioContext) { State.audioContext.close(); State.audioContext = null; }
       State.analyser = null;
+      State.lastTranscription = '';
       State.engine = null;
       updateEngineBadge();
       document.getElementById('level-fill').style.width = '0%';
