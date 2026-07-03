@@ -1085,6 +1085,7 @@
         let isSpeaking = false;
         let vadInferenceCount = 0;
         let vadErrorCount = 0;
+        let vadProcessing = false;  // guard against overlapping setInterval calls
         let speechStart = 0;
         let lastSpeechTime = 0;
         let silenceStart = 0;
@@ -1096,7 +1097,17 @@
         const SYLLABLES_PER_SEC = 7.0;
 
         async function processVadChunk() {
-          if (!State.isReciting) return;
+          if (!State.isReciting || vadFailed) return;
+          if (vadProcessing) return;  // prevent overlapping calls
+          vadProcessing = true;
+          try {
+            await processVadChunkInner();
+          } finally {
+            vadProcessing = false;
+          }
+        }
+
+        async function processVadChunkInner() {
 
           // Need at least CHUNK_SIZE samples
           if (audioBuffer.length === 0) return;
@@ -1208,6 +1219,13 @@
 
     // ── Energy-based fallback (if Silero VAD fails to load) ──
     async function startEnergyBasedFallback() {
+      // Idempotent — don't start twice
+      if (State.vadInterval && State.engine === 'energy') {
+        dbg('Energy-based already running — skipping');
+        return;
+      }
+      // Clear any existing VAD interval
+      if (State.vadInterval) { clearInterval(State.vadInterval); State.vadInterval = null; }
       // Ensure we have mic + analyser (might not be set if VAD path failed early)
       if (!State.mediaStream) {
         dbg('Energy fallback: requesting mic...');
