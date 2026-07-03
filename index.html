@@ -245,12 +245,15 @@
   </style>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Amiri:wght@400;700&display=swap" rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"></script>
-  <script>
-    // Configure ORT WASM paths before any inference
-    if (window.ort) {
-      ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
-    }
+  <script type="module">
+    // Use WASM-only ORT build — avoids removeChild DOM bug from the default build
+    // which injects <script> tags into the DOM. The wasm-only module never touches the DOM.
+    // This is the same approach used by Tilawa (github.com/yazinsai/tilawa).
+    import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.mjs";
+    ort.env.wasm.numThreads = 1;
+    ort.env.wasm.simd = true;
+    ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+    window.ort = ort;
   </script>
 </head>
 <body>
@@ -869,7 +872,13 @@
           return;
         }
       }
-      await startEnergyBasedFallback();
+      // Try Silero VAD first (if ORT loaded), fall back to energy-based
+      if (window.ort) {
+        await startEnergyBasedCounting();
+      } else {
+        dbg('ORT not loaded — using energy-based counting directly');
+        await startEnergyBasedFallback();
+      }
     }
 
     // ── Web Speech API word counting ──
@@ -945,12 +954,16 @@
           speechApiWorking = false;
           try { recognition.stop(); } catch (err) {}
           State.speechRecognition = null;
-          dbg('Starting energy-based fallback...');
-          startEnergyBasedFallback().catch(e => {
-            dbg('Energy fallback failed: ' + e.message);
-            updateStatus(' فشل تشغيل الميكروفون', 'error');
-            State.isReciting = false;
-            updateReciteButton();
+          dbg('Starting VAD fallback...');
+          startEnergyBasedCounting().catch(e => {
+            dbg('VAD fallback failed: ' + e.message);
+            dbg('Trying energy-based fallback...');
+            startEnergyBasedFallback().catch(e2 => {
+              dbg('All engines failed: ' + e2.message);
+              updateStatus(' فشل تشغيل الميكروفون', 'error');
+              State.isReciting = false;
+              updateReciteButton();
+            });
           });
         }
       };
@@ -974,7 +987,7 @@
           speechApiAbandoned = true;
           try { recognition.stop(); } catch (e) {}
           State.speechRecognition = null;
-          startEnergyBasedFallback().catch(e => dbg('Energy fallback (3s) failed: ' + e.message));
+          startEnergyBasedCounting().catch(e => dbg('VAD fallback (3s) failed: ' + e.message + ' — trying energy-based'));
         }
       }, 3000);
     }
@@ -982,9 +995,22 @@
     // ── Silero VAD word counting (fallback) ──
     // Uses Silero VAD (2MB ONNX model) to detect speech segments.
     // Counts speech bursts as words — much more accurate than energy-based.
-    // Runs entirely in-browser via ONNX Runtime Web (WASM backend).
+    // Runs entirely in-browser via ONNX Runtime Web WASM-only build.
     async function startEnergyBasedCounting() {
       try {
+        // Wait for ORT module to load (ES modules load async)
+        if (!window.ort) {
+          dbg('Waiting for ORT module to load...');
+          for (let i = 0; i < 50; i++) {  // wait up to 5 seconds
+            if (window.ort) break;
+            await new Promise(r => setTimeout(r, 100));
+          }
+        }
+        if (!window.ort) {
+          dbg('ORT module not loaded after 5s — falling back to energy-based');
+          return startEnergyBasedFallback();
+        }
+
         // Reuse existing mic stream if we already have one
         if (!State.mediaStream) {
           dbg('Requesting mic for VAD counting...');
