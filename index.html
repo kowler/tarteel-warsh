@@ -586,6 +586,8 @@
     function revealLine(lineIdx) {
       const seg = State.segmentEls[lineIdx];
       if (!seg) return;
+      // Don't re-reveal already revealed lines
+      if (seg.classList.contains('revealed')) return;
       seg.classList.remove('hidden', 'active');
       seg.classList.add('revealed');
       State.pageLines[lineIdx].revealed = true;
@@ -1279,21 +1281,23 @@
         document.getElementById('level-fill').style.width = Math.min(100, rms * 5) + '%';
         const now = Date.now();
 
-        if (isSpeaking) {
-          baseline = baseline * BASELINE_DECAY + rms * (1 - BASELINE_DECAY);
-          totalSpeechMs += 40; // interval is 40ms
-          State.totalSpeechMs = totalSpeechMs + pageSpeechOffset;
-        }
-
+        // Track whether we're in speech
         if (!isSpeaking) {
           if (rms > START_THRESHOLD) {
             isSpeaking = true;
             baseline = rms * 0.7;
             silenceStart = 0;
             speechStartMs = now;
+            dbg(`Energy: speech started (rms=${rms.toFixed(1)})`);
             updateStatus(' يرتل... ', 'listening');
           }
-          return;
+          // Don't return here — fall through to process speech if we just started
+        }
+
+        if (isSpeaking) {
+          baseline = baseline * BASELINE_DECAY + rms * (1 - BASELINE_DECAY);
+          totalSpeechMs += 40; // interval is 40ms
+          State.totalSpeechMs = totalSpeechMs + pageSpeechOffset;
         }
 
         // Estimate syllables from speech duration
@@ -1301,19 +1305,23 @@
         if (estimatedSyllables > lastUpdateSyllables) {
           spokenSyllables = estimatedSyllables;
           lastUpdateSyllables = estimatedSyllables;
+          dbg(`Energy: syl=${spokenSyllables} speechMs=${totalSpeechMs} rms=${rms.toFixed(1)} rate=${State.adaptiveRate.toFixed(1)}`);
           revealUpToWordCount(spokenSyllables, State.thresholds, State.revealState);
         }
 
-        if (rms < STOP_THRESHOLD) {
-          if (silenceStart === 0) silenceStart = now;
-          if (now - silenceStart > SILENCE_RESET_MS) {
-            isSpeaking = false;
+        if (isSpeaking) {
+          if (rms < STOP_THRESHOLD) {
+            if (silenceStart === 0) silenceStart = now;
+            if (now - silenceStart > SILENCE_RESET_MS) {
+              isSpeaking = false;
+              silenceStart = 0;
+              baseline = 0;
+              dbg(`Energy: speech ended (totalSpeechMs=${totalSpeechMs.toFixed(0)})`);
+              updateStatus(' يستمع... ', 'listening');
+            }
+          } else {
             silenceStart = 0;
-            baseline = 0;
-            updateStatus(' يستمع... ', 'listening');
           }
-        } else {
-          silenceStart = 0;
         }
       }, 40);
     }
