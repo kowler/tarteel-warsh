@@ -867,7 +867,7 @@
           return;
         }
       }
-      await startEnergyBasedCounting();
+      await startEnergyBasedFallback();
     }
 
     // ── Web Speech API word counting ──
@@ -943,16 +943,12 @@
           speechApiWorking = false;
           try { recognition.stop(); } catch (err) {}
           State.speechRecognition = null;
-          dbg('Starting VAD fallback...');
-          startEnergyBasedCounting().catch(e => {
-            dbg('VAD fallback failed: ' + e.message);
-            dbg('Trying energy-based fallback...');
-            startEnergyBasedFallback().catch(e2 => {
-              dbg('All engines failed: ' + e2.message);
-              updateStatus(' فشل تشغيل الميكروفون', 'error');
-              State.isReciting = false;
-              updateReciteButton();
-            });
+          dbg('Starting energy-based fallback...');
+          startEnergyBasedFallback().catch(e => {
+            dbg('Energy fallback failed: ' + e.message);
+            updateStatus(' فشل تشغيل الميكروفون', 'error');
+            State.isReciting = false;
+            updateReciteButton();
           });
         }
       };
@@ -976,7 +972,7 @@
           speechApiAbandoned = true;
           try { recognition.stop(); } catch (e) {}
           State.speechRecognition = null;
-          startEnergyBasedCounting().catch(e => dbg('VAD fallback (3s) failed: ' + e.message));
+          startEnergyBasedFallback().catch(e => dbg('Energy fallback (3s) failed: ' + e.message));
         }
       }, 3000);
     }
