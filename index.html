@@ -152,6 +152,17 @@
       -webkit-backdrop-filter: blur(6px);
       box-shadow: inset 0 0 0 2px rgba(74, 157, 106, 0.6);
     }
+    .line-segment.mistake {
+      background: transparent;
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
+      box-shadow: inset 0 0 0 2px rgba(220, 53, 69, 0.8), 0 0 12px rgba(220, 53, 69, 0.3);
+      animation: mistake-pulse 0.6s ease;
+    }
+    @keyframes mistake-pulse {
+      0% { box-shadow: inset 0 0 0 2px rgba(220, 53, 69, 1), 0 0 20px rgba(220, 53, 69, 0.6); }
+      100% { box-shadow: inset 0 0 0 2px rgba(220, 53, 69, 0.8), 0 0 12px rgba(220, 53, 69, 0.3); }
+    }
 
     .page-info {
       text-align: center; font-size: 12px; color: var(--text-dim);
@@ -298,17 +309,16 @@
     // Tarteel-Warsh — Pure browser PWA
     // No backend, no Groq, no server-side processing.
     //
-    // Word counting (primary): Web Speech API
-    //   Works on Chrome, Edge, Safari (all platforms: Windows,
-    //   macOS, Linux, Android, iOS). NOT on Firefox.
+    // PRIMARY: Whisper Tiny ONNX (Quran-fine-tuned) via transformers.js
+    //   Runs in Web Worker, word-level recognition, mistake detection.
+    //   39MB model (quantized), runs on any browser with WASM.
     //
-    // Word counting (fallback): Energy-based syllable pulse counting
-    //   Works on any browser with mic access (including Firefox).
-    //   Uses RMS amplitude spikes to detect spoken syllables.
+    // FALLBACK 1: Web Speech API (Chrome/Edge/Safari)
+    // FALLBACK 2: Energy-based syllable counting (any browser)
     //
-    // Line reveal: each line has a known word count from the mushaf
-    // text data. When enough words/syllables are spoken to fill the
-    // current line, reveal it. Simple, transport-agnostic.
+    // Line reveal: Whisper recognizes words → align against expected
+    // page lines → reveal lines as words match → highlight mistakes
+    // in red when recognized text doesn't match expected text.
     // ============================================================
 
     // ============================================================
@@ -331,11 +341,22 @@
       // Word counting state
       thresholds: null,
       revealState: null,
-      engine: null,  // 'speech-api' | 'energy'
+      engine: null,  // 'whisper' | 'speech-api' | 'energy'
       adaptiveRate: 7.0,     // syllables/sec — tuned live after each line reveal
       totalSpeechMs: 0,      // accumulated speech duration (VAD/energy paths)
       syllableOverflow: 0,   // extra syllables carried to next page on auto-advance
       pageCount: 1,          // 1 on narrow screens, 2 on wide (spread mode)
+      // Whisper engine state
+      whisperWorker: null,
+      whisperReady: false,
+      audioWorkletNode: null,
+      whisperAudioBuffer: [],
+      lastTranscription: '',
+      lastTranscriptionStable: false,
+      pageWordList: [],       // flat array of normalized words for current page(s)
+      lineWordRanges: [],     // [{start, end}] per line — word indices into pageWordList
+      currentWordIdx: 0,      // how many words have been matched
+      mistakeLines: new Set(), // line indices with detected mistakes
     };
 
     // ============================================================
@@ -767,8 +788,245 @@
     }
 
     // ============================================================
-    // Recitation — tries Web Speech API first, falls back to
-    // energy-based syllable counting.
+    // Arabic text normalization + Levenshtein (from Tilawa project)
+    // ============================================================
+    const DIACRITICS_RE = /[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DE\u06DF-\u06ED\u0640]/g;
+    const NORM_MAP = {
+      '\u0623': '\u0627', '\u0625': '\u0627', '\u0622': '\u0627', '\u0671': '\u0627',
+      '\u0629': '\u0647', '\u0649': '\u064A',
+    };
+    function normalizeArabic(text) {
+      text = text.replace(/\ufeff/g, '');
+      text = text.replace(DIACRITICS_RE, '');
+      text = text.replace(/./g, ch => NORM_MAP[ch] ?? ch);
+      return text.split(/\s+/).filter(Boolean).join(' ');
+    }
+
+    function levenshteinRatio(a, b) {
+      if (a === b) return 1.0;
+      if (!a.length || !b.length) return 0.0;
+      const aLen = a.length, bLen = b.length;
+      const dp = Array(bLen + 1).fill(0).map((_, i) => i);
+      for (let i = 1; i <= aLen; i++) {
+        let prev = dp[0]; dp[0] = i;
+        for (let j = 1; j <= bLen; j++) {
+          const tmp = dp[j];
+          dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+          prev = tmp;
+        }
+      }
+      const dist = dp[bLen];
+      return 1.0 - dist / Math.max(aLen, bLen);
+    }
+
+    // ============================================================
+    // Build word list for current page(s)
+    // Each line's text is normalized to a word array.
+    // We track cumulative word ranges per line.
+    // ============================================================
+    function buildPageWordList() {
+      State.pageWordList = [];
+      State.lineWordRanges = [];
+      for (let i = 0; i < State.pageLines.length; i++) {
+        const line = State.pageLines[i];
+        const text = line.text || line.uthmani || '';
+        const words = normalizeArabic(text).split(' ').filter(Boolean);
+        const start = State.pageWordList.length;
+        State.pageWordList.push(...words);
+        State.lineWordRanges.push({ start, end: State.pageWordList.length });
+      }
+      dbg(`Built page word list: ${State.pageWordList.length} words across ${State.lineWordRanges.length} lines`);
+    }
+
+    // ============================================================
+    // Word alignment — match recognized words against expected page words
+    // Uses fuzzy matching (Levenshtein ≥ 0.70) with lookahead (skip up to 5)
+    // Returns: { matchedWords, currentLine, mistakes }
+    // ============================================================
+    function alignWords(recognizedText) {
+      const recognizedWords = normalizeArabic(recognizedText).split(' ').filter(Boolean);
+      if (!recognizedWords.length) return { matchedCount: 0, newLine: State.currentLine, mistakes: [] };
+
+      const LOOKAHEAD = 5;
+      const MATCH_THRESHOLD = 0.70;
+      let wordPtr = State.currentWordIdx;
+      const mistakes = [];
+      let matchedCount = 0;
+
+      for (const recWord of recognizedWords) {
+        if (wordPtr >= State.pageWordList.length) break;
+        const limit = Math.min(wordPtr + LOOKAHEAD, State.pageWordList.length);
+        let found = false;
+        for (let j = wordPtr; j < limit; j++) {
+          const expected = State.pageWordList[j];
+          const ratio = levenshteinRatio(recWord, expected);
+          if (ratio >= MATCH_THRESHOLD) {
+            // Check if words between wordPtr and j were skipped (potential mistakes)
+            for (let k = wordPtr; k < j; k++) {
+              // Find which line this skipped word belongs to
+              for (let li = 0; li < State.lineWordRanges.length; li++) {
+                const r = State.lineWordRanges[li];
+                if (k >= r.start && k < r.end) {
+                  mistakes.push(li);
+                  break;
+                }
+              }
+            }
+            wordPtr = j + 1;
+            matchedCount++;
+            found = true;
+            break;
+          }
+        }
+        // If no match found, the word is unexpected — but don't advance pointer
+      }
+
+      // Determine current line based on wordPtr
+      let newLine = State.currentLine;
+      for (let li = 0; li < State.lineWordRanges.length; li++) {
+        const r = State.lineWordRanges[li];
+        if (wordPtr >= r.start && wordPtr < r.end) {
+          newLine = li;
+          break;
+        }
+        if (wordPtr >= r.end) newLine = li + 1;
+      }
+
+      return { matchedCount, newLine, mistakes, newWordIdx: wordPtr };
+    }
+
+    // ============================================================
+    // Mark a line as having a mistake (red border)
+    // ============================================================
+    function markMistake(lineIdx) {
+      if (State.mistakeLines.has(lineIdx)) return;
+      State.mistakeLines.add(lineIdx);
+      const seg = State.segmentEls[lineIdx];
+      if (seg) {
+        seg.classList.remove('hidden', 'active');
+        seg.classList.add('revealed', 'mistake');
+        dbg(`⚠ Mistake detected on line ${lineIdx + 1}`);
+      }
+    }
+
+    // ============================================================
+    // Whisper engine — uses Web Worker + AudioWorklet
+    // ============================================================
+    async function initWhisperWorker() {
+      if (State.whisperWorker) return State.whisperReady;
+      try {
+        dbg('Creating Whisper worker...');
+        State.whisperWorker = new Worker('whisper-worker.js', { type: 'module' });
+        State.whisperWorker.onmessage = (e) => {
+          const msg = e.data;
+          if (msg.type === 'loading' || msg.type === 'loading_progress') {
+            const pct = msg.percent || 0;
+            dbg(`Whisper loading: ${pct}%`);
+            updateStatus(` تحميل النموذج ${pct}%`, 'loading');
+          } else if (msg.type === 'ready') {
+            State.whisperReady = true;
+            dbg('Whisper model ready!');
+            if (State.isReciting) {
+              startWhisperAudioCapture();
+            }
+          } else if (msg.type === 'transcription') {
+            handleWhisperTranscription(msg);
+          } else if (msg.type === 'error') {
+            dbg('Whisper error: ' + msg.message);
+          }
+        };
+        State.whisperWorker.postMessage({ type: 'init' });
+        return false; // not ready yet
+      } catch (e) {
+        dbg('Failed to create Whisper worker: ' + e.message);
+        return false;
+      }
+    }
+
+    async function startWhisperAudioCapture() {
+      try {
+        const audioCtx = new AudioContext();
+        State.audioContext = audioCtx;
+        await audioCtx.audioWorklet.addModule('audio-processor.js');
+        const source = audioCtx.createMediaStreamSource(State.mediaStream);
+        const node = new AudioWorkletNode(audioCtx, 'audio-stream-processor');
+        State.audioWorkletNode = node;
+        node.port.onmessage = (e) => {
+          if (!State.isReciting || !State.whisperReady) return;
+          const samples = new Float32Array(e.data);
+          // Send to Whisper worker for inference
+          State.whisperWorker.postMessage({ type: 'audio', samples }, [samples.buffer]);
+        };
+        source.connect(node);
+        dbg('AudioWorklet connected to Whisper worker');
+      } catch (e) {
+        dbg('AudioWorklet failed: ' + e.message + ' — falling back to Speech API');
+        // Fall back to old engine
+        startRecitationEngine();
+      }
+    }
+
+    function handleWhisperTranscription(msg) {
+      if (!State.isReciting) return;
+      const text = msg.text.trim();
+      if (!text) return;
+
+      // Decode stability gate (from Tilawa): don't reveal lines until
+      // transcription stabilizes (≥70% similar to previous)
+      if (State.lastTranscription) {
+        const stability = levenshteinRatio(text, State.lastTranscription);
+        if (stability < 0.70) {
+          dbg(`Whisper: transcription unstable (${(stability*100).toFixed(0)}%) — waiting...`);
+          State.lastTranscription = text;
+          return;
+        }
+      }
+      State.lastTranscription = text;
+
+      // Align recognized words against expected page text
+      const result = alignWords(text);
+      if (result.matchedCount === 0) return;
+
+      // Mark mistakes
+      for (const lineIdx of result.mistakes) {
+        markMistake(lineIdx);
+      }
+
+      // Reveal lines up to current position
+      State.currentWordIdx = result.newWordIdx;
+      const oldLine = State.currentLine;
+      State.currentLine = result.newLine;
+
+      // Reveal all lines up to current
+      for (let li = oldLine; li <= result.newLine && li < State.segmentEls.length; li++) {
+        const seg = State.segmentEls[li];
+        if (seg && !seg.classList.contains('revealed') && !seg.classList.contains('mistake')) {
+          seg.classList.remove('hidden', 'active');
+          seg.classList.add('revealed');
+          dbg(`Whisper: revealed line ${li + 1}`);
+        }
+      }
+
+      // Set active line
+      if (State.currentLine < State.segmentEls.length) {
+        setActiveLine(State.currentLine);
+        const total = State.pageWordList.length;
+        const matched = State.currentWordIdx;
+        const pct = Math.round(matched / total * 100);
+        const mistakeInfo = State.mistakeLines.size > 0 ? ` • ⚠ ${State.mistakeLines.size} خطأ` : '';
+        updateStatus(` السطر ${State.currentLine + 1} — ${matched}/${total} كلمة (${pct}%)${mistakeInfo}`, 'listening');
+      }
+
+      // Auto-advance when page complete
+      if (State.currentWordIdx >= State.pageWordList.length * 0.95) {
+        dbg('Page complete via Whisper — auto-advancing');
+        autoAdvancePage(State.currentWordIdx, State.thresholds);
+      }
+    }
+
+    // ============================================================
+    // Recitation — tries Whisper first, falls back to Web Speech API,
+    // then energy-based syllable counting.
     // ============================================================
 
     async function startReciting() {
@@ -777,18 +1035,20 @@
       updateStatus(' يرتل... ', 'listening');
       setActiveLine(State.currentLine);
 
-      // Build word thresholds for this page
+      // Build word thresholds for this page (for fallback engines)
       State.thresholds = buildWordThresholds();
       State.revealState = { nextLineToReveal: 0 };
-      State.adaptiveRate = 7.0;   // reset to default each session
+      State.adaptiveRate = 7.0;
       State.totalSpeechMs = 0;
-      State.syllableOverflow = 0; // carry extra syllables across pages
+      State.syllableOverflow = 0;
 
-      // Step 1: Request mic permission via getUserMedia().
-      // This triggers the browser's mic permission prompt — essential
-      // for both Web Speech API and energy-based counting to work.
-      // Without this explicit prompt, Speech API can fail silently
-      // with "not-allowed" on some browsers (desktop Chrome, Edge).
+      // Build word list for Whisper word alignment
+      buildPageWordList();
+      State.currentWordIdx = 0;
+      State.mistakeLines.clear();
+      State.lastTranscription = '';
+
+      // Step 1: Request mic permission
       try {
         dbg('Requesting mic permission...');
         State.mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -808,7 +1068,26 @@
         return;
       }
 
+      // Try Whisper engine first, fall back to old engines
+      if (!State.whisperReady) {
+        dbg('Whisper not ready — initializing (will fall back to Speech API meanwhile)...');
+        initWhisperWorker();
+      }
+      // Always start with old engine as fallback while Whisper loads
       startRecitationEngine();
+      // If Whisper is already ready, switch to it
+      if (State.whisperReady) {
+        dbg('Whisper ready — starting audio capture');
+        // Stop fallback engine
+        if (State.speechRecognition) {
+          try { State.speechRecognition.stop(); } catch (e) {}
+          State.speechRecognition = null;
+        }
+        if (State.vadInterval) { clearInterval(State.vadInterval); State.vadInterval = null; }
+        State.engine = 'whisper';
+        updateEngineBadge();
+        startWhisperAudioCapture();
+      }
     }
 
     // Engine selector — called on first start and on auto-advance.
@@ -1364,6 +1643,7 @@
         State.speechRecognition = null;
       }
       if (State.vadInterval) { clearInterval(State.vadInterval); State.vadInterval = null; }
+      if (State.audioWorkletNode) { State.audioWorkletNode.disconnect(); State.audioWorkletNode = null; }
       if (State.mediaStream) { State.mediaStream.getTracks().forEach(t => t.stop()); State.mediaStream = null; }
       if (State.audioContext) { State.audioContext.close(); State.audioContext = null; }
       State.analyser = null;
@@ -1376,8 +1656,13 @@
           s.classList.add('hidden');
         }
       });
+      // Report mistakes summary
+      if (State.mistakeLines.size > 0) {
+        updateStatus(` ⚠ ${State.mistakeLines.size} أخطاء في هذه الصفحة`, 'warning');
+      } else {
+        updateStatus('');
+      }
       updateReciteButton();
-      updateStatus('');
     }
 
     // ============================================================
@@ -1406,7 +1691,8 @@
 
     function updateEngineBadge() {
       const badge = document.getElementById('engine-badge');
-      if (State.engine === 'speech-api') badge.textContent = 'Speech API';
+      if (State.engine === 'whisper') badge.textContent = 'Whisper 🎙️';
+      else if (State.engine === 'speech-api') badge.textContent = 'Speech API';
       else if (State.engine === 'silero-vad') badge.textContent = 'VAD';
       else if (State.engine === 'energy') badge.textContent = 'Energy';
       else badge.textContent = '—';
