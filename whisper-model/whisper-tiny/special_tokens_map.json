@@ -22,7 +22,7 @@
     "<|hi|>",
     "<|fi|>",
     "<|vi|>",
-    "<|he|>",
+    "<|iw|>",
     "<|uk|>",
     "<|el|>",
     "<|ms|>",
@@ -111,14 +111,14 @@
   "bos_token": {
     "content": "<|endoftext|>",
     "lstrip": false,
-    "normalized": false,
+    "normalized": true,
     "rstrip": false,
     "single_word": false
   },
   "eos_token": {
     "content": "<|endoftext|>",
     "lstrip": false,
-    "normalized": false,
+    "normalized": true,
     "rstrip": false,
     "single_word": false
   },
@@ -130,9 +130,9 @@
     "single_word": false
   },
   "unk_token": {
-    "content": "<|endoftext|>",
+    "content": "",
     "lstrip": false,
-    "normalized": false,
+    "normalized": true,
     "rstrip": false,
     "single_word": false
   }
