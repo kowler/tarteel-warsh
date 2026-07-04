@@ -7,6 +7,11 @@ env.allowLocalModels = true;
 env.allowRemoteModels = false;
 env.localModelPath = "/whisper-model/";
 
+// Catch uncaught errors so they're visible in the main thread
+self.onerror = (e) => {
+  postMessage({ type: "error", message: "Worker uncaught: " + (e?.message || String(e)) });
+};
+
 let transcriber = null;
 let isProcessing = false;
 let audioBuffer = [];
@@ -32,7 +37,7 @@ self.onmessage = async (e) => {
       });
       postMessage({ type: "ready" });
     } catch (err) {
-      postMessage({ type: "error", message: err.message });
+      postMessage({ type: "error", message: err?.message || String(err) || "Unknown error" });
     }
     return;
   }
@@ -79,7 +84,7 @@ self.onmessage = async (e) => {
         chunks: output.chunks || [],
       });
     } catch (err) {
-      postMessage({ type: "error", message: err.message });
+      postMessage({ type: "error", message: err?.message || String(err) || "Inference error" });
     } finally {
       isProcessing = false;
       // Keep last 0.5s of audio for continuity between inference cycles
