@@ -1,6 +1,6 @@
 // Whisper inference worker — loads Whisper Tiny via transformers.js
 // Runs in Web Worker, accumulates 16kHz audio chunks, runs inference every ~2.5s
-import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.17.0";
+import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
 
 // Allow local model files only (no remote downloads)
 env.allowRemoteModels = false;

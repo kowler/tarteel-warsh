@@ -975,6 +975,10 @@
             dbg('Whisper error: ' + msg.message);
           }
         };
+        State.whisperWorker.onerror = (e) => {
+          dbg('Whisper worker FAILED: ' + (e.message || e.filename + ':' + e.lineno));
+          updateStatus(' فشل تحميل النموذج ', 'error');
+        };
         State.whisperWorker.postMessage({ type: 'init' });
         return false; // not ready yet
       } catch (e) {
