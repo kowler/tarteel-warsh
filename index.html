@@ -994,17 +994,6 @@
       if (State.speechRecognition) {
         try { State.speechRecognition.stop(); } catch (e) {}
         State.speechRecognition = null;
-        State.speechApiAbandoned = true; // prevent restart
-      }
-      // Stop VAD/energy interval if running (energy engine also uses vadInterval)
-      if (State.vadInterval) {
-        clearInterval(State.vadInterval);
-        State.vadInterval = null;
-      }
-      // Stop energy interval if separately set
-      if (State.energyInterval) {
-        clearInterval(State.energyInterval);
-        State.energyInterval = null;
       }
       State.engine = 'whisper';
       updateEngineBadge();
@@ -1013,9 +1002,21 @@
 
     async function startWhisperAudioCapture() {
       try {
+        // Re-acquire mic if Speech API released it
+        if (!State.mediaStream) {
+          dbg('Re-acquiring mic for Whisper...');
+          State.mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              channelCount: 1,
+              sampleRate: 16000,
+              echoCancellation: true,
+              noiseSuppression: true,
+            }
+          });
+        }
         // Reuse existing AudioContext or create new one
         if (!State.audioContext || State.audioContext.state === 'closed') {
-          State.audioContext = new AudioContext();
+          State.audioContext = new AudioContext({ sampleRate: 16000 });
         }
         if (State.audioContext.state === 'suspended') {
           await State.audioContext.resume();
@@ -1035,7 +1036,7 @@
         updateStatus(' يستمع (Whisper) ', 'listening');
       } catch (e) {
         dbg('AudioWorklet failed: ' + e.message + ' — falling back to Speech API');
-        // Fall back to old engine
+        // Fall back to Speech API
         startRecitationEngine();
       }
     }
