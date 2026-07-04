@@ -833,7 +833,14 @@
       State.lineWordRanges = [];
       for (let i = 0; i < State.pageLines.length; i++) {
         const line = State.pageLines[i];
-        const text = line.text || line.uthmani || '';
+        // pageLines[i].words is an array of {text, sura, aya} objects
+        // from buildPageLines(). Join all word texts into one string.
+        let text = '';
+        if (line.words && line.words.length > 0) {
+          text = line.words.map(w => w.text || w).join(' ');
+        } else if (line.text) {
+          text = line.text;
+        }
         const words = normalizeArabic(text).split(' ').filter(Boolean);
         const start = State.pageWordList.length;
         State.pageWordList.push(...words);
