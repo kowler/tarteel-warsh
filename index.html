@@ -365,13 +365,14 @@
     // ============================================================
     function dbg(msg) {
       console.log('[DBG] ' + msg);
-      const panel = document.getElementById('debug-panel');
-      if (panel.classList.contains('visible')) {
+      try {
+        const panel = document.getElementById('debug-panel');
+        if (!panel || !panel.classList.contains('visible')) return;
         const time = new Date().toLocaleTimeString();
         panel.innerHTML = `<div>[${time}] ${msg}</div>` + panel.innerHTML;
         const lines = panel.children;
-        if (lines.length > 20) panel.removeChild(panel[lines.length - 1]);
-      }
+        if (lines.length > 20) panel.removeChild(lines[lines.length - 1]);
+      } catch (e) { /* logging must never break calling code */ }
     }
 
     // ============================================================
