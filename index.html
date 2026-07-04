@@ -850,29 +850,37 @@
 
       const LOOKAHEAD = 5;
       const MATCH_THRESHOLD = 0.70;
+      // A recognized word whose BEST candidate ratio falls below this is
+      // considered "a completely different word" — flag immediately,
+      // no need to wait for a second consecutive miss.
+      const MISTAKE_THRESHOLD = 0.35;
       let wordPtr = State.currentWordIdx;
       const mistakes = [];
       let matchedCount = 0;
       let unmatchedCount = 0;
 
+      const lineOfWordIdx = (idx) => {
+        for (let li = 0; li < State.lineWordRanges.length; li++) {
+          const r = State.lineWordRanges[li];
+          if (idx >= r.start && idx < r.end) return li;
+        }
+        return -1;
+      };
+
       for (const recWord of recognizedWords) {
         if (wordPtr >= State.pageWordList.length) break;
         const limit = Math.min(wordPtr + LOOKAHEAD, State.pageWordList.length);
         let found = false;
+        let bestRatio = 0;
         for (let j = wordPtr; j < limit; j++) {
           const expected = State.pageWordList[j];
           const ratio = levenshteinRatio(recWord, expected);
+          if (ratio > bestRatio) bestRatio = ratio;
           if (ratio >= MATCH_THRESHOLD) {
             // Check if words between wordPtr and j were skipped (potential mistakes)
             for (let k = wordPtr; k < j; k++) {
-              // Find which line this skipped word belongs to
-              for (let li = 0; li < State.lineWordRanges.length; li++) {
-                const r = State.lineWordRanges[li];
-                if (k >= r.start && k < r.end) {
-                  mistakes.push(li);
-                  break;
-                }
-              }
+              const li = lineOfWordIdx(k);
+              if (li !== -1) mistakes.push(li);
             }
             wordPtr = j + 1;
             matchedCount++;
@@ -883,32 +891,33 @@
         // If no match found, the recited word is wrong/unexpected
         if (!found) {
           unmatchedCount++;
-          // After 2+ consecutive unmatched words, mark current line as mistake
-          if (unmatchedCount >= 2) {
-            // Find which line the current wordPtr belongs to
-            for (let li = 0; li < State.lineWordRanges.length; li++) {
-              const r = State.lineWordRanges[li];
-              if (wordPtr >= r.start && wordPtr < r.end) {
-                mistakes.push(li);
-                break;
-              }
-            }
+          if (bestRatio < MISTAKE_THRESHOLD) {
+            // Completely different word — flag its expected line right away.
+            const li = lineOfWordIdx(wordPtr);
+            if (li !== -1) mistakes.push(li);
+          } else if (unmatchedCount >= 2) {
+            // Borderline/ambiguous misses: only flag after 2+ in a row.
+            const li = lineOfWordIdx(wordPtr);
+            if (li !== -1) mistakes.push(li);
           }
+        } else {
+          unmatchedCount = 0;
         }
       }
 
-      // Determine current line based on wordPtr
-      let newLine = State.currentLine;
+      // Determine the currently ACTIVE line: the first line whose word
+      // range is not yet fully covered by wordPtr. Lines strictly before
+      // this one have been fully recited.
+      let newLine = State.lineWordRanges.length;
       for (let li = 0; li < State.lineWordRanges.length; li++) {
         const r = State.lineWordRanges[li];
-        if (wordPtr >= r.start && wordPtr < r.end) {
+        if (wordPtr < r.end) {
           newLine = li;
           break;
         }
-        if (wordPtr >= r.end) newLine = li + 1;
       }
 
-      if (unmatchedCount > 0) {
+      if (unmatchedCount > 0 || mistakes.length > 0) {
         dbg(`alignWords: ${matchedCount} matched, ${unmatchedCount} unmatched, ${mistakes.length} mistakes`);
       }
       return { matchedCount, newLine, mistakes, newWordIdx: wordPtr };
@@ -1081,15 +1090,17 @@
         markMistake(lineIdx);
       }
 
-      // Reveal lines up to current position
+      // Reveal lines that are now FULLY recited (strictly before the
+      // current in-progress line). The current line itself stays hidden
+      // until the recitation moves past it — this is what makes reveal
+      // happen only after a line is completely recited, not mid-line.
       State.currentWordIdx = result.newWordIdx;
       const oldLine = State.currentLine;
       State.currentLine = result.newLine;
 
-      // Reveal all lines up to current
-      for (let li = oldLine; li <= result.newLine && li < State.segmentEls.length; li++) {
+      for (let li = oldLine; li < result.newLine && li < State.segmentEls.length; li++) {
         const seg = State.segmentEls[li];
-        if (seg && !seg.classList.contains('revealed') && !seg.classList.contains('mistake')) {
+        if (seg && !seg.classList.contains('revealed')) {
           seg.classList.remove('hidden', 'active');
           seg.classList.add('revealed');
           dbg(`Whisper: revealed line ${li + 1}`);
