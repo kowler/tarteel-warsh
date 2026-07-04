@@ -20,7 +20,7 @@ self.onmessage = async (e) => {
     postMessage({ type: "loading", message: "Loading Whisper model..." });
     try {
       transcriber = await pipeline("automatic-speech-recognition", "whisper-tiny", {
-        dtype: "q8",
+        dtype: "fp16",
         progress_callback: (progress) => {
           if (progress.status === "progress") {
             postMessage({
