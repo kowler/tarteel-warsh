@@ -2,7 +2,8 @@
 // Runs in Web Worker, accumulates 16kHz audio chunks, runs inference every ~2.5s
 import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
 
-// Allow local model files only (no remote downloads)
+// In worker context, allowLocalModels defaults to false — must set explicitly
+env.allowLocalModels = true;
 env.allowRemoteModels = false;
 env.localModelPath = "/whisper-model/";
 
