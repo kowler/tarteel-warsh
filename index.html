@@ -241,6 +241,14 @@
       border: 1px solid #333;
     }
     .debug-panel.visible { display: block; }
+    .debug-panel .copy-btn {
+      position: absolute; top: 2px; right: 2px;
+      background: var(--surface); color: var(--text-dim);
+      border: 1px solid #333; border-radius: 4px;
+      padding: 2px 6px; font-size: 10px; cursor: pointer;
+      font-family: monospace;
+    }
+    .debug-panel .copy-btn:hover { color: var(--text); }
 
     .loader {
       text-align: center; padding: 60px 20px; color: var(--text-dim);
@@ -296,7 +304,7 @@
     </div>
   </div>
 
-  <div class="debug-panel" id="debug-panel"></div>
+  <div class="debug-panel" id="debug-panel"><button class="copy-btn" id="copy-logs-btn">📋 Copy</button></div>
 
   <div class="controls">
     <span class="engine-badge" id="engine-badge">—</span>
@@ -370,15 +378,22 @@
     // ============================================================
     // Debug logging
     // ============================================================
+    const _logBuffer = [];
+    const MAX_LOGS = 500;
+
     function dbg(msg) {
+      const time = new Date().toLocaleTimeString();
+      const entry = `[${time}] ${msg}`;
       console.log('[DBG] ' + msg);
+      _logBuffer.push(entry);
+      if (_logBuffer.length > MAX_LOGS) _logBuffer.shift();
       try {
         const panel = document.getElementById('debug-panel');
         if (!panel || !panel.classList.contains('visible')) return;
-        const time = new Date().toLocaleTimeString();
-        panel.innerHTML = `<div>[${time}] ${msg}</div>` + panel.innerHTML;
-        const lines = panel.children;
-        if (lines.length > 20) panel.removeChild(lines[lines.length - 1]);
+        const div = document.createElement('div');
+        div.textContent = entry;
+        panel.insertBefore(div, panel.firstChild.nextSibling); // after copy button
+        while (panel.children.length > 22) panel.removeChild(panel.lastChild);
       } catch (e) { /* logging must never break calling code */ }
     }
 
@@ -1830,6 +1845,26 @@
     });
     document.getElementById('debug-btn').addEventListener('click', () => {
       document.getElementById('debug-panel').classList.toggle('visible');
+    });
+    document.getElementById('copy-logs-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      const text = _logBuffer.join('\n');
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = document.getElementById('copy-logs-btn');
+        btn.textContent = '✅ Copied!';
+        setTimeout(() => { btn.textContent = '📋 Copy'; }, 1500);
+      }).catch(() => {
+        // Fallback: select text
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        const btn = document.getElementById('copy-logs-btn');
+        btn.textContent = '✅ Copied!';
+        setTimeout(() => { btn.textContent = '📋 Copy'; }, 1500);
+      });
     });
 
     // Tap-to-reveal: tap on the mushaf page to reveal the next line
