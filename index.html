@@ -1429,7 +1429,7 @@
         let vadFailed = false;
         try {
           dbg('Loading Silero VAD model...');
-          vadSession = await ort.InferenceSession.create('silero_vad.onnx', {
+          vadSession = await ort.InferenceSession.create('silero_vad.onnx?v=2', {
             executionProviders: ['wasm'],
             graphOptimizationLevel: 'all',
           });
