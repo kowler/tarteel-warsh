@@ -159,6 +159,13 @@
       box-shadow: inset 0 0 0 2px rgba(220, 53, 69, 0.8), 0 0 12px rgba(220, 53, 69, 0.3);
       animation: mistake-pulse 0.6s ease;
     }
+    /* Mistake on a hidden line: stays hidden (dark overlay) + red border */
+    .line-segment.hidden.mistake {
+      background: rgba(8, 8, 8, 0.93);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      box-shadow: inset 0 0 0 2px rgba(220, 53, 69, 0.8), 0 0 12px rgba(220, 53, 69, 0.3);
+    }
     @keyframes mistake-pulse {
       0% { box-shadow: inset 0 0 0 2px rgba(220, 53, 69, 1), 0 0 20px rgba(220, 53, 69, 0.6); }
       100% { box-shadow: inset 0 0 0 2px rgba(220, 53, 69, 0.8), 0 0 12px rgba(220, 53, 69, 0.3); }
@@ -708,7 +715,7 @@
     // ============================================================
     let autoAdvancePending = false;
 
-    function autoAdvancePage(spokenSyllables, thresholds) {
+    function autoAdvancePage(matchedWords, _) {
       // Avoid double-trigger
       if (autoAdvancePending) return;
       autoAdvancePending = true;
@@ -723,12 +730,7 @@
         return;
       }
 
-      // Calculate overflow: syllables spoken beyond the last line's threshold
-      const lastThreshold = thresholds.cumulativeThresholds[thresholds.cumulativeThresholds.length - 1];
-      const overflow = Math.max(0, spokenSyllables - lastThreshold);
-      State.syllableOverflow = overflow;
-
-      dbg(`Auto-advancing to page ${nextPageNum} (overflow=${overflow} syllables, step=${step})`);
+      dbg(`Auto-advancing to page ${nextPageNum} (step=${step})`);
 
       // Stop current engine without stopping recitation state
       stopRecitationEngine();
@@ -932,9 +934,11 @@
       State.mistakeLines.add(lineIdx);
       const seg = State.segmentEls[lineIdx];
       if (seg) {
-        seg.classList.remove('hidden', 'active');
-        seg.classList.add('revealed', 'mistake');
-        dbg(`⚠ Mistake detected on line ${lineIdx + 1}`);
+        // Keep the line hidden (dark overlay) but add red border.
+        // Only manual tap-reveal will reveal it.
+        seg.classList.remove('active');
+        seg.classList.add('hidden', 'mistake');
+        dbg(`⚠ Mistake on line ${lineIdx + 1} — hidden + red border (tap to reveal)`);
       }
     }
 
@@ -1120,14 +1124,16 @@
 
       // Auto-advance when page complete
       if (State.currentWordIdx >= State.pageWordList.length * 0.95) {
-        dbg('Page complete via Whisper — auto-advancing');
-        autoAdvancePage(State.currentWordIdx, State.thresholds);
+        dbg('Page complete via word alignment — auto-advancing');
+        autoAdvancePage(State.currentWordIdx, null);
       }
     }
 
     // ============================================================
-    // Recitation — tries Whisper first, falls back to Web Speech API,
-    // then energy-based syllable counting.
+    // Recitation — word-alignment only (Tilawa approach).
+    // No syllable counting, no VAD, no energy fallback.
+    // Lines reveal ONLY when all their words are matched.
+    // Mistakes (wrong word, word skip) → hidden + red border.
     // ============================================================
 
     async function startReciting() {
@@ -1136,14 +1142,7 @@
       updateStatus(' يرتل... ', 'listening');
       setActiveLine(State.currentLine);
 
-      // Build word thresholds for this page (for fallback engines)
-      State.thresholds = buildWordThresholds();
-      State.revealState = { nextLineToReveal: 0 };
-      State.adaptiveRate = 7.0;
-      State.totalSpeechMs = 0;
-      State.syllableOverflow = 0;
-
-      // Build word list for Whisper word alignment
+      // Build word list for word alignment
       buildPageWordList();
       State.currentWordIdx = 0;
       State.mistakeLines.clear();
@@ -1169,16 +1168,14 @@
         return;
       }
 
-      // Try Whisper engine first — load model, show loading status
-      // The old syllable/speech engine will NOT run while Whisper loads.
-      // When Whisper becomes ready, it takes over automatically.
-      // If Whisper fails to load, fall back to old engine.
+      // Try Whisper engine first — load model, show loading status.
+      // While Whisper loads, use Speech API as temporary fallback.
       if (!State.whisperReady) {
         dbg('Whisper not ready — initializing...');
         updateStatus(' تحميل النموذج... ', 'loading');
         initWhisperWorker();
-        // Start old engine as temporary fallback — will be replaced when Whisper is ready
-        dbg('Starting syllable engine as temporary fallback while Whisper loads...');
+        // Start Speech API as temporary fallback — will be replaced when Whisper is ready
+        dbg('Starting Speech API as temporary fallback while Whisper loads...');
         startRecitationEngine();
       } else {
         // Whisper already loaded — use it directly
@@ -1187,7 +1184,6 @@
           try { State.speechRecognition.stop(); } catch (e) {}
           State.speechRecognition = null;
         }
-        if (State.vadInterval) { clearInterval(State.vadInterval); State.vadInterval = null; }
         State.engine = 'whisper';
         updateEngineBadge();
         startWhisperAudioCapture();
@@ -1195,26 +1191,17 @@
     }
 
     // Engine selector — called on first start and on auto-advance.
-    // Assumes mic permission is already granted and State.mediaStream
-    // is available (or was released for Speech API).
+    // Uses Speech API (word alignment) as fallback while Whisper loads.
     async function startRecitationEngine() {
       // Reset auto-advance guard
       autoAdvancePending = false;
 
-      // Save accumulated speech duration for adaptive rate continuity
-      const savedSpeechMs = State.totalSpeechMs;
-      State._pageSpeechOffset = savedSpeechMs;
-
-      // Build thresholds for the current page
-      State.thresholds = buildWordThresholds();
-      State.revealState = { nextLineToReveal: 0 };
+      // Build word list for the new page and reset alignment state
+      buildPageWordList();
+      State.currentWordIdx = 0;
+      State.mistakeLines.clear();
+      State.lastTranscription = '';
       setActiveLine(State.currentLine);
-
-      // If we have overflow syllables from the previous page, apply them
-      if (State.syllableOverflow > 0) {
-        dbg(`Applying ${State.syllableOverflow} overflow syllables to new page`);
-        revealUpToWordCount(State.syllableOverflow, State.thresholds, State.revealState);
-      }
 
       // Try Web Speech API (Chrome, Edge, Safari — all platforms).
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -1226,133 +1213,76 @@
           State.mediaStream = null;
         }
         try {
-          startSpeechApiCounting(SpeechRecognition);
+          startSpeechApiAlignment(SpeechRecognition);
           return;
         } catch (e) {
-          dbg('Speech API start failed: ' + e.message + ' — falling back to energy-based');
+          dbg('Speech API start failed: ' + e.message);
         }
       } else {
-        dbg('Web Speech API not available — using energy-based counting');
-      }
-
-      // Fallback — Silero VAD / energy-based counting.
-      // Need to re-acquire mic stream if we don't have one
-      if (!State.mediaStream) {
-        try {
-          State.mediaStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              channelCount: 1,
-              sampleRate: 16000,
-              echoCancellation: true,
-              noiseSuppression: true,
-            }
-          });
-        } catch (e) {
-          dbg('Mic re-acquire failed: ' + e.message);
-          updateStatus(' فشل الميكروفون: ' + e.message, 'error');
-          State.isReciting = false;
-          updateReciteButton();
-          return;
-        }
-      }
-      // Try Silero VAD first (if ORT loaded), fall back to energy-based
-      if (window.ort) {
-        await startEnergyBasedCounting();
-      } else {
-        dbg('ORT not loaded — using energy-based counting directly');
-        await startEnergyBasedFallback();
+        dbg('Web Speech API not available — waiting for Whisper');
+        updateStatus(' تحميل النموذج... ', 'loading');
       }
     }
 
-    // ── Web Speech API word counting ──
-    function startSpeechApiCounting(SpeechRecognition) {
+    // ── Web Speech API word alignment (Tilawa approach) ──
+    // Uses Speech API to transcribe words, then aligns them against
+    // the expected page text. Lines reveal only when fully matched.
+    function startSpeechApiAlignment(SpeechRecognition) {
       const recognition = new SpeechRecognition();
       recognition.lang = 'ar-SA';
       recognition.continuous = true;
       recognition.interimResults = true;
 
-      let spokenSyllables = 0;
       let speechApiWorking = false;
-      let speechApiAbandoned = false;  // hard stop — set on fatal error, never reset
-      let sessionOffset = 0;
-      let reciteStart = Date.now();
-      let pageSpeechOffset = State._pageSpeechOffset || 0;
-
-      // In tarteel recitation, average ~3.4 syllables per word.
-      // Speech API transcribes words; we convert to syllables using
-      // the average ratio. This is more stable than word counting
-      // because it naturally accounts for wasl (joined words still
-      // produce the same total syllable count).
-      const SYLLABLES_PER_WORD = 3.4;
+      let speechApiAbandoned = false;
+      let lastTranscript = '';
 
       recognition.onstart = () => {
         speechApiWorking = true;
-        sessionOffset = spokenSyllables;
         State.engine = 'speech-api';
         updateEngineBadge();
-        dbg(`Speech API (re)started — offset=${sessionOffset}`);
+        dbg('Speech API (re)started');
       };
 
       recognition.onresult = (event) => {
-        let sessionWords = 0;
+        if (!State.isReciting) return;
+
+        // Build full transcript from all results
+        let fullTranscript = '';
         for (let i = 0; i < event.results.length; i++) {
-          const transcript = event.results[i][0].transcript;
-          const words = transcript.trim().split(/\s+/).filter(w => w.length > 0);
-          sessionWords += words.length;
+          fullTranscript += event.results[i][0].transcript + ' ';
         }
+        fullTranscript = fullTranscript.trim();
+        if (!fullTranscript) return;
 
-        // Track speech duration for adaptive rate
-        State.totalSpeechMs = (Date.now() - reciteStart) + pageSpeechOffset;
+        dbg(`Speech API: "${fullTranscript.substring(0, 60)}${fullTranscript.length > 60 ? '...' : ''}"`);
 
-        // Convert words to syllables
-        let total = sessionOffset + Math.round(sessionWords * SYLLABLES_PER_WORD);
-
-        // Duration-based floor using adaptive rate
-        const elapsedSec = (Date.now() - reciteStart) / 1000;
-        if (elapsedSec > 3) {
-          const durationFloor = Math.round(elapsedSec * State.adaptiveRate);
-          if (durationFloor > total) {
-            dbg(`Duration floor: ${durationFloor} > speech ${total}, using floor`);
-            total = durationFloor;
-          }
-        }
-
-        if (total > spokenSyllables) {
-          spokenSyllables = total;
-          dbg(`Syllables: ${spokenSyllables} (sessionWords=${sessionWords}, elapsed=${elapsedSec.toFixed(1)}s)`);
-          revealUpToWordCount(spokenSyllables, State.thresholds, State.revealState);
-        }
+        // Align recognized words against expected page text
+        const result = alignWords(fullTranscript);
+        processAlignment(result, fullTranscript);
+        lastTranscript = fullTranscript;
       };
 
       recognition.onerror = (e) => {
         dbg('Speech API error: ' + e.error);
         if (e.error === 'no-speech' || e.error === 'aborted') return;
-        // On fatal errors, fall back to VAD/energy-based counting
-        if (speechApiAbandoned) return;  // already handled
+        if (speechApiAbandoned) return;
         if (e.error === 'not-allowed' || e.error === 'service-not-allowed' ||
             e.error === 'network' || e.error === 'audio-capture' ||
             e.error === 'service-not-found' || e.error === 'bad-grammar') {
-          dbg(`Speech API fatal error (${e.error}) — falling back to VAD/energy`);
+          dbg(`Speech API fatal error (${e.error}) — waiting for Whisper`);
           speechApiAbandoned = true;
           speechApiWorking = false;
           try { recognition.stop(); } catch (err) {}
           State.speechRecognition = null;
-          dbg('Starting VAD fallback...');
-          startEnergyBasedCounting().catch(e => {
-            dbg('VAD fallback failed: ' + e.message);
-            dbg('Trying energy-based fallback...');
-            startEnergyBasedFallback().catch(e2 => {
-              dbg('All engines failed: ' + e2.message);
-              updateStatus(' فشل تشغيل الميكروفون', 'error');
-              State.isReciting = false;
-              updateReciteButton();
-            });
-          });
+          // If Whisper isn't ready yet, show loading status
+          if (!State.whisperReady) {
+            updateStatus(' تحميل النموذج... ', 'loading');
+          }
         }
       };
 
       recognition.onend = () => {
-        // Hard stop: never restart after a fatal error
         if (speechApiAbandoned) return;
         if (State.isReciting && speechApiWorking && State.engine === 'speech-api') {
           dbg('Speech API ended, restarting...');
@@ -1363,14 +1293,16 @@
       State.speechRecognition = recognition;
       recognition.start();
 
-      // Give it 3 seconds — if no onstart, fall back
+      // Give it 3 seconds — if no onstart, wait for Whisper
       setTimeout(() => {
-        if (!speechApiWorking && State.isReciting && State.engine !== 'speech-api' && !speechApiAbandoned) {
-          dbg('Speech API did not start in 3s — falling back to VAD');
+        if (!speechApiWorking && State.isReciting && !speechApiAbandoned) {
+          dbg('Speech API did not start in 3s — waiting for Whisper');
           speechApiAbandoned = true;
           try { recognition.stop(); } catch (e) {}
           State.speechRecognition = null;
-          startEnergyBasedCounting().catch(e => dbg('VAD fallback (3s) failed: ' + e.message + ' — trying energy-based'));
+          if (!State.whisperReady) {
+            updateStatus(' تحميل النموذج... ', 'loading');
+          }
         }
       }, 3000);
     }
@@ -1841,13 +1773,22 @@
     // Manual line reveal (tap to reveal)
     // ============================================================
     function tapRevealNext() {
-      if (!State.thresholds) return;
-      const idx = State.revealState.nextLineToReveal;
-      if (idx < State.pageLines.length) {
-        // Jump the syllable counter forward to this line's threshold
-        const targetSyl = State.thresholds.cumulativeThresholds[idx];
-        revealUpToWordCount(targetSyl, State.thresholds, State.revealState);
-        dbg(`Tap-revealed line ${idx} (forced syllables=${targetSyl})`);
+      // Reveal the next hidden line directly — no syllable counting.
+      // This is the manual safety net: if a line is hidden (either not
+      // yet recited or marked as mistake), a tap reveals it.
+      for (let i = 0; i < State.segmentEls.length; i++) {
+        const seg = State.segmentEls[i];
+        if (seg && !seg.classList.contains('revealed')) {
+          seg.classList.remove('hidden', 'active', 'mistake');
+          seg.classList.add('revealed');
+          State.pageLines[i].revealed = true;
+          dbg(`Tap-revealed line ${i + 1}`);
+          // Set active line to the next one
+          if (i + 1 < State.segmentEls.length) {
+            setActiveLine(i + 1);
+          }
+          return;
+        }
       }
     }
 
