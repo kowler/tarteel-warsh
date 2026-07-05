@@ -152,11 +152,22 @@
       backdrop-filter: none;
       -webkit-backdrop-filter: none;
     }
+    .line-segment.revealed.off-track {
+      background: rgba(201, 74, 74, 0.25);
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
+    }
     .line-segment.active {
       background: rgba(8, 8, 8, 0.88);
       backdrop-filter: blur(6px);
       -webkit-backdrop-filter: blur(6px);
       box-shadow: inset 0 0 0 2px rgba(74, 157, 106, 0.6);
+    }
+    .line-segment.active.off-track {
+      background: rgba(201, 74, 74, 0.25);
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
+      box-shadow: inset 0 0 0 2px rgba(201, 74, 74, 0.7);
     }
     .line-segment.mistake {
       background: transparent;
@@ -381,6 +392,7 @@
       lineWordRanges: [],     // [{start, end}] per line — word indices into pageWordList
       currentWordIdx: 0,      // how many words have been matched
       mistakeLines: new Set(), // line indices with detected mistakes
+      offTrack: false,        // true when recitation is completely off from expected text
     };
 
     // ============================================================
@@ -951,7 +963,7 @@
     // ============================================================
     function alignWords(recognizedText) {
       const recognizedWords = normalizeArabic(recognizedText).split(' ').filter(Boolean);
-      if (!recognizedWords.length) return { matchedCount: 0, newLine: State.currentLine, mistakes: [], newWordIdx: State.currentWordIdx };
+      if (!recognizedWords.length) return { matchedCount: 0, newLine: State.currentLine, mistakes: [], newWordIdx: State.currentWordIdx, offTrack: false };
 
       const MATCH_THRESHOLD = 0.50;
       const LOOKAHEAD = 5; // how many page words to look ahead for a match
@@ -960,6 +972,7 @@
       const nPage = pageWords.length;
       let matchedCount = 0;
       let consecutiveMatches = 0;
+      let validWords = 0; // count of non-trivial recognized words
 
       const lineOfWordIdx = (idx) => {
         for (let li = 0; li < State.lineWordRanges.length; li++) {
@@ -973,6 +986,7 @@
         // Skip very short words (1-2 chars) — they match too many things
         // and cause false jumps ahead
         if (recWord.length < 2) continue;
+        validWords++;
         if (wordPtr >= nPage) break;
         const limit = Math.min(wordPtr + LOOKAHEAD, nPage);
         let bestRatio = 0;
@@ -994,10 +1008,15 @@
         }
       }
 
+      // Off-track: Whisper heard enough words but NONE matched the expected
+      // text near the current position — the reciter is saying something
+      // completely different from what's on the page.
+      const offTrack = validWords >= 3 && matchedCount === 0;
+
       // Accept any match — even a single word advances the pointer.
       if (matchedCount === 0) {
-        dbg(`alignWords: no matches found`);
-        return { matchedCount: 0, newLine: State.currentLine, mistakes: [], newWordIdx: State.currentWordIdx };
+        dbg(`alignWords: no matches found${offTrack ? ' — OFF TRACK' : ''}`);
+        return { matchedCount: 0, newLine: State.currentLine, mistakes: [], newWordIdx: State.currentWordIdx, offTrack };
       }
 
       // No jump limit — the growing buffer transcribes everything from the
@@ -1015,7 +1034,7 @@
       }
 
       dbg(`alignWords: ${matchedCount}/${recognizedWords.length} matched, →word ${newWordIdx} (line ${newLine + 1})`);
-      return { matchedCount, newLine, mistakes: [], newWordIdx };
+      return { matchedCount, newLine, mistakes: [], newWordIdx, offTrack: false };
     }
 
     // ============================================================
@@ -1175,16 +1194,40 @@
 
     // Process alignment result — reveal lines, mark mistakes
     function processAlignment(result, fullText) {
+      // Don't process if auto-advance is pending (page switch in progress)
+      if (autoAdvancePending) return;
+      // Don't process if no Whisper worker (page switch in progress)
+      if (!State.audioWorkletNode) return;
+
+      // Off-track: reciter is saying something completely different.
+      // Highlight relevant lines in light red and stop advancing.
+      if (result.offTrack) {
+        dbg('⚠ Off-track! Recitation does not match page — highlighting red');
+        // Highlight all revealed lines around the current position
+        for (let li = 0; li < State.segmentEls.length; li++) {
+          const seg = State.segmentEls[li];
+          if (!seg) continue;
+          // Only mark lines that are revealed or active (visible to user)
+          if (seg.classList.contains('revealed') || seg.classList.contains('active')) {
+            seg.classList.add('off-track');
+          }
+        }
+        State.offTrack = true;
+        updateStatus(' ⚠ التلاوة غير مطابقة — راجع السطور الحمراء ', 'error');
+        return;
+      }
+
+      // Back on track — remove red highlights
+      if (State.offTrack) {
+        dbg('Back on track — removing red highlights');
+        State.segmentEls.forEach(seg => seg.classList.remove('off-track'));
+        State.offTrack = false;
+      }
+
       if (result.matchedCount === 0) {
         dbg('Whisper: no words matched page text');
         return;
       }
-
-      // Don't process if auto-advance is pending (page switch in progress)
-      if (autoAdvancePending) return;
-
-      // Don't process if no Whisper worker (page switch in progress)
-      if (!State.audioWorkletNode) return;
 
       // Mark mistakes
       for (const lineIdx of result.mistakes) {
@@ -1793,6 +1836,7 @@
       if (State.audioContext) { State.audioContext.close(); State.audioContext = null; }
       State.analyser = null;
       State.lastTranscription = '';
+      State.offTrack = false;
       State.engine = null;
       updateEngineBadge();
       document.getElementById('level-fill').style.width = '0%';
@@ -1914,10 +1958,16 @@
       for (let i = State.segmentEls.length - 1; i >= 0; i--) {
         const seg = State.segmentEls[i];
         if (seg && seg.classList.contains('revealed')) {
-          seg.classList.remove('revealed', 'active');
+          seg.classList.remove('revealed', 'active', 'off-track');
           seg.classList.add('hidden');
           State.pageLines[i].revealed = false;
           dbg(`Tap-hid line ${i + 1}`);
+          // Clear off-track state — user is manually correcting
+          if (State.offTrack) {
+            State.offTrack = false;
+            State.segmentEls.forEach(s => s.classList.remove('off-track'));
+            dbg('Off-track cleared by manual hide');
+          }
           syncPointerToVisualState();
           return;
         }
