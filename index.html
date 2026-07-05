@@ -26,12 +26,18 @@
       --radius: 12px;
     }
 
+    html, body {
+      height: auto;
+      min-height: 100%;
+    }
+
     body {
       font-family: 'Amiri', 'Noto Naskh Arabic', 'Times New Roman', serif;
       background: var(--bg);
       color: var(--text);
       min-height: 100vh;
       overflow-x: hidden;
+      overflow-y: auto;
       -webkit-font-smoothing: antialiased;
     }
 
@@ -126,7 +132,7 @@
       background: #fff;
       box-shadow: 0 4px 20px rgba(0,0,0,0.5);
     }
-    .mushaf-page img { width: 100%; display: block; }
+    .mushaf-page img { width: 100%; height: auto; display: block; }
 
     /* ── Line overlay segments ── */
     .line-segment {

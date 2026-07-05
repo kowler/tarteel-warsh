@@ -16,7 +16,7 @@ let audioBuffer = [];
 let currentPrompt = "";
 
 const WINDOW_SAMPLES = 16000 * 8;   // 8s window for quality
-const TRIGGER_INTERVAL = 16000 * 3; // process every 3s of new audio (overlapping)
+const TRIGGER_INTERVAL = 16000 * 2; // process every 2s of new audio (overlapping)
 let lastProcessedAt = 0; // track how much audio we've processed
 
 self.onmessage = async (e) => {
