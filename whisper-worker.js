@@ -1,13 +1,11 @@
 // Whisper inference worker — loads Whisper Tiny via transformers.js
-// Runs in Web Worker, accumulates 16kHz audio chunks, runs inference every ~2.5s
+// WebGPU active → inference ~0.2s. Use rolling 5s window.
 import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
 
-// In worker context, allowLocalModels defaults to false — must set explicitly
 env.allowLocalModels = true;
 env.allowRemoteModels = false;
 env.localModelPath = "/whisper-model/";
 
-// Catch uncaught errors so they're visible in the main thread
 self.onerror = (e) => {
   postMessage({ type: "error", message: "Worker uncaught: " + (e?.message || String(e)) });
 };
@@ -15,8 +13,11 @@ self.onerror = (e) => {
 let transcriber = null;
 let isProcessing = false;
 let audioBuffer = [];
-const ACCUMULATE_SAMPLES = 40000; // ~2.5s at 16kHz — Whisper needs at least 1-2s
-const MAX_BUFFER_SAMPLES = 16000 * 30; // 30s max — Whisper's max context
+let currentPrompt = "";
+
+const WINDOW_SAMPLES = 16000 * 8;   // 8s window for quality
+const TRIGGER_INTERVAL = 16000 * 3; // process every 3s of new audio (overlapping)
+let lastProcessedAt = 0; // track how much audio we've processed
 
 self.onmessage = async (e) => {
   const msg = e.data;
@@ -24,8 +25,8 @@ self.onmessage = async (e) => {
   if (msg.type === "init") {
     postMessage({ type: "loading", message: "Loading Whisper model..." });
     try {
-      transcriber = await pipeline("automatic-speech-recognition", "whisper-tiny", {
-        dtype: "q4",
+      const pipelineOpts = {
+        dtype: "fp32",
         progress_callback: (progress) => {
           if (progress.status === "progress") {
             postMessage({
@@ -34,7 +35,18 @@ self.onmessage = async (e) => {
             });
           }
         },
-      });
+      };
+      // Try WebGPU first (10-50x faster), fallback to WASM
+      try {
+        pipelineOpts.device = "webgpu";
+        transcriber = await pipeline("automatic-speech-recognition", "whisper-tiny", pipelineOpts);
+        postMessage({ type: "info", message: "WebGPU active" });
+      } catch (gpuErr) {
+        postMessage({ type: "info", message: "WebGPU unavailable, using WASM" });
+        delete pipelineOpts.device;
+        transcriber = await pipeline("automatic-speech-recognition", "whisper-tiny", pipelineOpts);
+      }
+      postMessage({ type: "loading_progress", percent: 100 });
       postMessage({ type: "ready" });
     } catch (err) {
       postMessage({ type: "error", message: err?.message || String(err) || "Unknown error" });
@@ -42,42 +54,50 @@ self.onmessage = async (e) => {
     return;
   }
 
+  if (msg.type === "set_prompt") {
+    currentPrompt = msg.text || "";
+    return;
+  }
+
   if (msg.type === "audio") {
     if (!transcriber) return;
 
-    // Accumulate audio samples
+    // Accumulate audio
     const samples = new Float32Array(msg.samples);
     for (let i = 0; i < samples.length; i++) {
       audioBuffer.push(samples[i]);
     }
 
-    // Wait until we have enough audio and we're not already processing
-    if (audioBuffer.length < ACCUMULATE_SAMPLES) return;
-    if (isProcessing) return; // drop chunk if still processing
+    // Wait for at least 8s before first processing
+    if (audioBuffer.length < WINDOW_SAMPLES) return;
+    // After first processing, trigger every TRIGGER_INTERVAL samples of new audio
+    if (isProcessing) return;
+    const newAudioSinceLast = audioBuffer.length - lastProcessedAt;
+    if (lastProcessedAt > 0 && newAudioSinceLast < TRIGGER_INTERVAL) return;
 
     isProcessing = true;
 
-    // Take accumulated audio (cap at MAX_BUFFER_SAMPLES)
-    let toProcess;
-    if (audioBuffer.length > MAX_BUFFER_SAMPLES) {
-      // Keep only the last MAX_BUFFER_SAMPLES
-      toProcess = new Float32Array(audioBuffer.slice(-MAX_BUFFER_SAMPLES));
-      audioBuffer = audioBuffer.slice(-MAX_BUFFER_SAMPLES);
-    } else {
-      toProcess = new Float32Array(audioBuffer);
+    // Take the last 8s (rolling window)
+    const startIdx = Math.max(0, audioBuffer.length - WINDOW_SAMPLES);
+    const toProcess = new Float32Array(audioBuffer.slice(startIdx));
+    lastProcessedAt = audioBuffer.length;
+
+    // Trim buffer: keep last 8s so it doesn't grow forever
+    if (audioBuffer.length > WINDOW_SAMPLES * 2) {
+      audioBuffer = audioBuffer.slice(-WINDOW_SAMPLES);
+      lastProcessedAt = audioBuffer.length;
     }
 
     try {
-      // Run Whisper inference with Arabic language hint
-      const output = await transcriber(toProcess, {
+      const opts = {
         language: "ar",
         task: "transcribe",
-        chunk_length_s: 30,
-        stride_length_s: 5,
         return_timestamps: true,
-      });
-
-      // Send back recognized text + timestamps
+      };
+      if (currentPrompt) {
+        opts.initial_prompt = currentPrompt;
+      }
+      const output = await transcriber(toProcess, opts);
       postMessage({
         type: "transcription",
         text: output.text || "",
@@ -87,10 +107,9 @@ self.onmessage = async (e) => {
       postMessage({ type: "error", message: err?.message || String(err) || "Inference error" });
     } finally {
       isProcessing = false;
-      // Keep last 0.5s of audio for continuity between inference cycles
-      const keepSamples = 8000; // 0.5s at 16kHz
-      if (audioBuffer.length > keepSamples) {
-        audioBuffer = audioBuffer.slice(-keepSamples);
+      // Trim if buffer grew large during processing
+      if (audioBuffer.length > WINDOW_SAMPLES * 3) {
+        audioBuffer = audioBuffer.slice(-WINDOW_SAMPLES);
       }
     }
     return;
@@ -99,6 +118,7 @@ self.onmessage = async (e) => {
   if (msg.type === "reset") {
     audioBuffer = [];
     isProcessing = false;
+    lastProcessedAt = 0;
     return;
   }
 };

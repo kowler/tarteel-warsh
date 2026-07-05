@@ -364,6 +364,8 @@
       // Whisper engine state
       whisperWorker: null,
       whisperReady: false,
+      whisperLoading: false,
+      whisperLoadError: null,
       audioWorkletNode: null,
       whisperAudioBuffer: [],
       lastTranscription: '',
@@ -408,7 +410,9 @@
         populateHizbSelect();
         State.currentPage = 1;
         renderPage(1);
-        document.getElementById('recite-btn').disabled = false;
+        // Start preloading Whisper model immediately — button stays disabled
+        // (showing "تحميل النموذج...") until the model is ready.
+        initWhisperWorker();
       } catch (e) {
         document.getElementById('page-container').innerHTML =
           '<div class="loader"><p style="color:var(--error)">فشل تحميل المصحف</p></div>';
@@ -606,7 +610,31 @@
       // If we're reciting and auto-advancing, kick off the new page
       if (State.isReciting && State._pendingAutoAdvance) {
         State._pendingAutoAdvance = false;
-        startRecitationEngine();
+        autoAdvancePending = false;
+        buildPageWordList();
+        syncPointerToVisualState();
+        State.mistakeLines.clear();
+        State.lastTranscription = '';
+        if (State.whisperWorker && State.whisperReady) {
+          // DON'T reset the worker — keep the audio buffer flowing.
+          // Just update the prompt for the new page's text.
+          // The rolling 8s window will naturally transition to the
+          // new page's audio within 2-3 cycles (~6-9s).
+          const pageText = State.pageWordList.join(' ');
+          if (pageText) {
+            State.whisperWorker.postMessage({ type: 'set_prompt', text: pageText.substring(0, 200) });
+          }
+          // If audio worklet is still connected (we didn't stop it),
+          // nothing else to do — audio keeps flowing.
+          // If not (e.g. first start), start capture.
+          if (!State.audioWorkletNode) {
+            State.engine = 'whisper';
+            updateEngineBadge();
+            startWhisperAudioCapture();
+          } else {
+            dbg('Audio still flowing — just updated prompt for new page');
+          }
+        }
       }
 
       // Update nav buttons
@@ -626,6 +654,32 @@
       } else {
         updateStatus(`صفحة ${pages[0].page} — ${surahName}`);
       }
+    }
+
+    // ============================================================
+    // Sync word pointer to visual state — finds the first hidden line
+    // and sets currentWordIdx/currentLine to that position.
+    // Called on: startReciting, auto-advance, manual page switch.
+    // ============================================================
+    function syncPointerToVisualState() {
+      State.currentWordIdx = 0;
+      State.currentLine = 0;
+      for (let i = 0; i < State.segmentEls.length; i++) {
+        const seg = State.segmentEls[i];
+        if (!seg || !seg.classList.contains('revealed')) {
+          // First hidden line — set pointer to start of this line
+          if (State.lineWordRanges[i]) {
+            State.currentWordIdx = State.lineWordRanges[i].start;
+            State.currentLine = i;
+          }
+          break;
+        }
+        // This line is revealed — advance pointer past it
+        if (State.lineWordRanges[i]) {
+          State.currentWordIdx = State.lineWordRanges[i].end;
+        }
+      }
+      setActiveLine(State.currentLine);
     }
 
     // ============================================================
@@ -747,8 +801,10 @@
 
       dbg(`Auto-advancing to page ${nextPageNum} (step=${step})`);
 
-      // Stop current engine without stopping recitation state
-      stopRecitationEngine();
+      // NOTE: Do NOT stop the engine — keep audio flowing to avoid
+      // the 8s buffer refill that causes lag after page switch.
+      // Just guard transcriptions until the new page's word list is ready
+      // (autoAdvancePending does this — handleWhisperTranscription checks it).
 
       updateStatus(` ← صفحة ${nextPageNum} `, 'listening');
 
@@ -759,6 +815,15 @@
 
     // Stop engine but keep isReciting true (for auto-advance)
     function stopRecitationEngine() {
+      // Stop Whisper worker from processing stale audio
+      if (State.whisperWorker) {
+        State.whisperWorker.postMessage({ type: 'reset' });
+      }
+      // Disconnect AudioWorklet so no more audio goes to worker
+      if (State.audioWorkletNode) {
+        try { State.audioWorkletNode.disconnect(); } catch(e) {}
+        State.audioWorkletNode = null;
+      }
       if (State.speechRecognition) {
         try { State.speechRecognition.stop(); } catch (e) {}
         State.speechRecognition = null;
@@ -865,24 +930,30 @@
     }
 
     // ============================================================
-    // Word alignment — match recognized words against expected page words
-    // Uses fuzzy matching (Levenshtein ≥ 0.70) with lookahead (skip up to 5)
-    // Returns: { matchedWords, currentLine, mistakes }
+    // Word alignment — subsequence matching approach.
+    // Whisper chunks are noisy (3s of audio → partial/garbled text).
+    // Instead of requiring the whole chunk to match as a block,
+    // we find individual recognized words that match page words
+    // near the current position, and advance through them.
+    //
+    // Strategy:
+    // 1. For each recognized word, find the best match in a window
+    //    around the current position (lookahead up to 8 words)
+    // 2. If it matches, advance the pointer past it
+    // 3. Reveal lines when all their words are covered
+    // 4. Only flag mistakes for words that are completely wrong (<0.30)
     // ============================================================
     function alignWords(recognizedText) {
       const recognizedWords = normalizeArabic(recognizedText).split(' ').filter(Boolean);
-      if (!recognizedWords.length) return { matchedCount: 0, newLine: State.currentLine, mistakes: [] };
+      if (!recognizedWords.length) return { matchedCount: 0, newLine: State.currentLine, mistakes: [], newWordIdx: State.currentWordIdx };
 
-      const LOOKAHEAD = 5;
-      const MATCH_THRESHOLD = 0.70;
-      // A recognized word whose BEST candidate ratio falls below this is
-      // considered "a completely different word" — flag immediately,
-      // no need to wait for a second consecutive miss.
-      const MISTAKE_THRESHOLD = 0.35;
+      const MATCH_THRESHOLD = 0.50;
+      const LOOKAHEAD = 5; // how many page words to look ahead for a match
       let wordPtr = State.currentWordIdx;
-      const mistakes = [];
+      const pageWords = State.pageWordList;
+      const nPage = pageWords.length;
       let matchedCount = 0;
-      let unmatchedCount = 0;
+      let consecutiveMatches = 0;
 
       const lineOfWordIdx = (idx) => {
         for (let li = 0; li < State.lineWordRanges.length; li++) {
@@ -893,59 +964,52 @@
       };
 
       for (const recWord of recognizedWords) {
-        if (wordPtr >= State.pageWordList.length) break;
-        const limit = Math.min(wordPtr + LOOKAHEAD, State.pageWordList.length);
-        let found = false;
+        // Skip very short words (1-2 chars) — they match too many things
+        // and cause false jumps ahead
+        if (recWord.length < 2) continue;
+        if (wordPtr >= nPage) break;
+        const limit = Math.min(wordPtr + LOOKAHEAD, nPage);
         let bestRatio = 0;
+        let bestIdx = -1;
         for (let j = wordPtr; j < limit; j++) {
-          const expected = State.pageWordList[j];
-          const ratio = levenshteinRatio(recWord, expected);
-          if (ratio > bestRatio) bestRatio = ratio;
-          if (ratio >= MATCH_THRESHOLD) {
-            // Check if words between wordPtr and j were skipped (potential mistakes)
-            for (let k = wordPtr; k < j; k++) {
-              const li = lineOfWordIdx(k);
-              if (li !== -1) mistakes.push(li);
-            }
-            wordPtr = j + 1;
-            matchedCount++;
-            found = true;
-            break;
+          const ratio = levenshteinRatio(recWord, pageWords[j]);
+          if (ratio > bestRatio) {
+            bestRatio = ratio;
+            bestIdx = j;
           }
         }
-        // If no match found, the recited word is wrong/unexpected
-        if (!found) {
-          unmatchedCount++;
-          if (bestRatio < MISTAKE_THRESHOLD) {
-            // Completely different word — flag its expected line right away.
-            const li = lineOfWordIdx(wordPtr);
-            if (li !== -1) mistakes.push(li);
-          } else if (unmatchedCount >= 2) {
-            // Borderline/ambiguous misses: only flag after 2+ in a row.
-            const li = lineOfWordIdx(wordPtr);
-            if (li !== -1) mistakes.push(li);
-          }
+        if (bestRatio >= MATCH_THRESHOLD) {
+          // Match found — advance pointer past the matched word
+          wordPtr = bestIdx + 1;
+          matchedCount++;
+          consecutiveMatches++;
         } else {
-          unmatchedCount = 0;
+          consecutiveMatches = 0;
         }
       }
 
-      // Determine the currently ACTIVE line: the first line whose word
-      // range is not yet fully covered by wordPtr. Lines strictly before
-      // this one have been fully recited.
+      // Accept any match — even a single word advances the pointer.
+      if (matchedCount === 0) {
+        dbg(`alignWords: no matches found`);
+        return { matchedCount: 0, newLine: State.currentLine, mistakes: [], newWordIdx: State.currentWordIdx };
+      }
+
+      // No jump limit — the growing buffer transcribes everything from the
+      // start, so wordPtr correctly tracks the furthest point recited.
+      const newWordIdx = Math.min(wordPtr, nPage);
+
+      // Determine the currently ACTIVE line
       let newLine = State.lineWordRanges.length;
       for (let li = 0; li < State.lineWordRanges.length; li++) {
         const r = State.lineWordRanges[li];
-        if (wordPtr < r.end) {
+        if (newWordIdx < r.end) {
           newLine = li;
           break;
         }
       }
 
-      if (unmatchedCount > 0 || mistakes.length > 0) {
-        dbg(`alignWords: ${matchedCount} matched, ${unmatchedCount} unmatched, ${mistakes.length} mistakes`);
-      }
-      return { matchedCount, newLine, mistakes, newWordIdx: wordPtr };
+      dbg(`alignWords: ${matchedCount}/${recognizedWords.length} matched, →word ${newWordIdx} (line ${newLine + 1})`);
+      return { matchedCount, newLine, mistakes: [], newWordIdx };
     }
 
     // ============================================================
@@ -969,6 +1033,10 @@
     // ============================================================
     async function initWhisperWorker() {
       if (State.whisperWorker) return State.whisperReady;
+      if (State.whisperLoading) return false;
+      State.whisperLoading = true;
+      State.whisperLoadError = null;
+      updateReciteButton();
       try {
         dbg('Creating Whisper worker...');
         State.whisperWorker = new Worker('whisper-worker.js', { type: 'module' });
@@ -978,26 +1046,41 @@
             const pct = msg.percent || 0;
             dbg(`Whisper loading: ${pct}%`);
             updateStatus(` تحميل النموذج ${pct}%`, 'loading');
+            updateReciteButton();
           } else if (msg.type === 'ready') {
             State.whisperReady = true;
+            State.whisperLoading = false;
             dbg('Whisper model ready!');
+            updateReciteButton();
             if (State.isReciting) {
               switchToWhisperEngine();
             }
           } else if (msg.type === 'transcription') {
             handleWhisperTranscription(msg);
+          } else if (msg.type === 'info') {
+            dbg('Whisper: ' + msg.message);
           } else if (msg.type === 'error') {
             dbg('Whisper error: ' + msg.message);
+            State.whisperLoading = false;
+            State.whisperLoadError = msg.message;
+            updateReciteButton();
+            updateStatus(' فشل تحميل النموذج: ' + msg.message, 'error');
           }
         };
         State.whisperWorker.onerror = (e) => {
           dbg('Whisper worker FAILED: ' + (e.message || e.filename + ':' + e.lineno));
+          State.whisperLoading = false;
+          State.whisperLoadError = e.message || 'worker error';
           updateStatus(' فشل تحميل النموذج ', 'error');
+          updateReciteButton();
         };
         State.whisperWorker.postMessage({ type: 'init' });
         return false; // not ready yet
       } catch (e) {
         dbg('Failed to create Whisper worker: ' + e.message);
+        State.whisperLoading = false;
+        State.whisperLoadError = e.message;
+        updateReciteButton();
         return false;
       }
     }
@@ -1047,6 +1130,12 @@
           State.whisperWorker.postMessage({ type: 'audio', samples }, [samples.buffer]);
         };
         source.connect(node);
+        // Send the current page text as initial_prompt to prime Whisper
+        // for Quranic Arabic — this dramatically improves accuracy.
+        const pageText = State.pageWordList.join(' ');
+        if (pageText) {
+          State.whisperWorker.postMessage({ type: 'set_prompt', text: pageText.substring(0, 200) });
+        }
         dbg('AudioWorklet connected to Whisper worker');
         updateStatus(' يستمع (Whisper) ', 'listening');
       } catch (e) {
@@ -1058,6 +1147,8 @@
 
     function handleWhisperTranscription(msg) {
       if (!State.isReciting) return;
+      // Ignore transcriptions during page switch
+      if (autoAdvancePending || !State.audioWorkletNode) return;
       const text = msg.text.trim();
       if (!text) {
         dbg('Whisper: empty transcription, skipping');
@@ -1066,43 +1157,9 @@
 
       dbg(`Whisper transcribed: "${text.substring(0, 60)}${text.length > 60 ? '...' : ''}"`);
 
-      // Decode stability gate (from Tilawa): if the transcription is very
-      // different from the previous one, it might be an unstable decode.
-      // But since we accumulate audio, the full text will always grow.
-      // So we only compare the LAST N words to check stability of the latest portion.
-      if (State.lastTranscription) {
-        // Extract the new portion (text after the last known good transcription)
-        const prevWords = normalizeArabic(State.lastTranscription).split(' ').filter(Boolean);
-        const currWords = normalizeArabic(text).split(' ').filter(Boolean);
-        // If current starts with most of previous, extract the new tail
-        if (currWords.length > prevWords.length) {
-          const overlap = prevWords.filter((w, i) => currWords[i] === w).length;
-          const overlapRatio = overlap / prevWords.length;
-          if (overlapRatio > 0.5) {
-            // Good overlap — extract new words
-            const newWords = currWords.slice(prevWords.length);
-            if (newWords.length === 0) {
-              dbg('Whisper: no new words since last transcription');
-              return;
-            }
-            // Only align the new portion
-            const newText = newWords.join(' ');
-            const result = alignWords(newText);
-            processAlignment(result, text);
-            State.lastTranscription = text;
-            return;
-          }
-        }
-        // Low overlap — transcription changed significantly (unstable decode)
-        // Use a lower threshold: only skip if it's wildly different
-        const stability = levenshteinRatio(text, State.lastTranscription);
-        if (stability < 0.30) {
-          dbg(`Whisper: transcription very unstable (${(stability*100).toFixed(0)}%) — skipping`);
-          State.lastTranscription = text;
-          return;
-        }
-      }
-
+      // No stability gate — each chunk is independent in streaming mode.
+      // If Whisper produces garbage, alignWords simply won't match and
+      // nothing bad happens. The stability gate was skipping valid transcriptions.
       State.lastTranscription = text;
 
       // Align recognized words against expected page text
@@ -1116,6 +1173,12 @@
         dbg('Whisper: no words matched page text');
         return;
       }
+
+      // Don't process if auto-advance is pending (page switch in progress)
+      if (autoAdvancePending) return;
+
+      // Don't process if no Whisper worker (page switch in progress)
+      if (!State.audioWorkletNode) return;
 
       // Mark mistakes
       for (const lineIdx of result.mistakes) {
@@ -1149,8 +1212,8 @@
         updateStatus(` السطر ${State.currentLine + 1} — ${matched}/${total} كلمة (${pct}%)${mistakeInfo}`, 'listening');
       }
 
-      // Auto-advance when page complete
-      if (State.currentWordIdx >= State.pageWordList.length * 0.95) {
+      // Auto-advance when page complete (100% of words matched)
+      if (State.currentWordIdx >= State.pageWordList.length) {
         dbg('Page complete via word alignment — auto-advancing');
         autoAdvancePage(State.currentWordIdx, null);
       }
@@ -1169,9 +1232,9 @@
       updateStatus(' يرتل... ', 'listening');
       setActiveLine(State.currentLine);
 
-      // Build word list for word alignment
+      // Build word list and sync pointer to visual state
       buildPageWordList();
-      State.currentWordIdx = 0;
+      syncPointerToVisualState();
       State.mistakeLines.clear();
       State.lastTranscription = '';
 
@@ -1195,26 +1258,29 @@
         return;
       }
 
-      // Try Whisper engine first — load model, show loading status.
-      // While Whisper loads, use Speech API as temporary fallback.
+      // Whisper preloads on page load. By the time the user can click
+      // (button enabled), the model should be ready. If still loading
+      // (slow connection), show loading status and wait.
       if (!State.whisperReady) {
-        dbg('Whisper not ready — initializing...');
-        updateStatus(' تحميل النموذج... ', 'loading');
-        initWhisperWorker();
-        // Start Speech API as temporary fallback — will be replaced when Whisper is ready
-        dbg('Starting Speech API as temporary fallback while Whisper loads...');
-        startRecitationEngine();
-      } else {
-        // Whisper already loaded — use it directly
-        dbg('Whisper ready — starting audio capture');
-        if (State.speechRecognition) {
-          try { State.speechRecognition.stop(); } catch (e) {}
-          State.speechRecognition = null;
+        if (State.whisperLoadError) {
+          updateStatus(' فشل تحميل النموذج — ' + State.whisperLoadError, 'error');
+          State.isReciting = false;
+          updateReciteButton();
+          return;
         }
-        State.engine = 'whisper';
-        updateEngineBadge();
-        startWhisperAudioCapture();
+        // Still loading — wait for it (shouldn't happen since button is disabled)
+        dbg('Whisper still loading — waiting...');
+        updateStatus(' تحميل النموذج... ', 'loading');
+        State.isReciting = false;
+        updateReciteButton();
+        return;
       }
+
+      // Whisper ready — start audio capture
+      dbg('Whisper ready — starting audio capture');
+      State.engine = 'whisper';
+      updateEngineBadge();
+      startWhisperAudioCapture();
     }
 
     // Engine selector — called on first start and on auto-advance.
@@ -1748,10 +1814,22 @@
       const text = document.getElementById('recite-text');
       if (State.isReciting) {
         btn.classList.add('recording');
+        btn.disabled = false;
         icon.textContent = '⏹️';
         text.textContent = 'إيقاف';
+      } else if (State.whisperLoading) {
+        btn.classList.remove('recording');
+        btn.disabled = true;
+        icon.textContent = '⏳';
+        text.textContent = 'تحميل النموذج...';
+      } else if (State.whisperLoadError) {
+        btn.classList.remove('recording');
+        btn.disabled = true;
+        icon.textContent = '⚠️';
+        text.textContent = 'فشل تحميل النموذج';
       } else {
         btn.classList.remove('recording');
+        btn.disabled = false;
         icon.textContent = '🎙️';
         text.textContent = 'ابدأ التلاوة';
       }
@@ -1780,16 +1858,29 @@
     function nextPage() {
       const step = State.pageCount || 1;
       if (State.currentPage + step <= State.data.meta.totalPages) {
-        stopReciting();
-        renderPage(State.currentPage + step);
+        if (State.isReciting) {
+          // Switch page without stopping recitation or the engine.
+          // Keep audio flowing — just update prompt + word list on new page.
+          State._pendingAutoAdvance = true;
+          renderPage(State.currentPage + step);
+        } else {
+          stopReciting();
+          renderPage(State.currentPage + step);
+        }
       }
     }
 
     function prevPage() {
       const step = State.pageCount || 1;
       if (State.currentPage - step >= 1) {
-        stopReciting();
-        renderPage(State.currentPage - step);
+        if (State.isReciting) {
+          // Switch page without stopping recitation or the engine.
+          State._pendingAutoAdvance = true;
+          renderPage(State.currentPage - step);
+        } else {
+          stopReciting();
+          renderPage(State.currentPage - step);
+        }
       } else if (State.currentPage > 1) {
         stopReciting();
         renderPage(1);
@@ -1797,12 +1888,9 @@
     }
 
     // ============================================================
-    // Manual line reveal (tap to reveal)
+    // Manual line reveal/hide (tap, arrows, keyboard)
     // ============================================================
     function tapRevealNext() {
-      // Reveal the next hidden line directly — no syllable counting.
-      // This is the manual safety net: if a line is hidden (either not
-      // yet recited or marked as mistake), a tap reveals it.
       for (let i = 0; i < State.segmentEls.length; i++) {
         const seg = State.segmentEls[i];
         if (seg && !seg.classList.contains('revealed')) {
@@ -1810,10 +1898,21 @@
           seg.classList.add('revealed');
           State.pageLines[i].revealed = true;
           dbg(`Tap-revealed line ${i + 1}`);
-          // Set active line to the next one
-          if (i + 1 < State.segmentEls.length) {
-            setActiveLine(i + 1);
-          }
+          syncPointerToVisualState();
+          return;
+        }
+      }
+    }
+
+    function tapHideLast() {
+      for (let i = State.segmentEls.length - 1; i >= 0; i--) {
+        const seg = State.segmentEls[i];
+        if (seg && seg.classList.contains('revealed')) {
+          seg.classList.remove('revealed', 'active');
+          seg.classList.add('hidden');
+          State.pageLines[i].revealed = false;
+          dbg(`Tap-hid line ${i + 1}`);
+          syncPointerToVisualState();
           return;
         }
       }
@@ -1875,8 +1974,10 @@
     document.addEventListener('keydown', e => {
       if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
       if (e.key === 'ArrowLeft') nextPage();
-      if (e.key === 'ArrowRight') prevPage();
-      if (e.key === ' ' || e.key === 'Enter') {
+      else if (e.key === 'ArrowRight') prevPage();
+      else if (e.key === 'ArrowDown') { e.preventDefault(); tapRevealNext(); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); tapHideLast(); }
+      else if (e.key === ' ' || e.key === 'Enter') {
         e.preventDefault();
         tapRevealNext();
       }
