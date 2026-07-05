@@ -1,5 +1,0 @@
-# Large model files — served from local Pi dev server, not GitHub
-whisper-model/whisper-tiny/onnx/
-*.onnx
-*.mp3
-*.wav
