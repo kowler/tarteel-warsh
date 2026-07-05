@@ -393,6 +393,7 @@
       currentWordIdx: 0,      // how many words have been matched
       mistakeLines: new Set(), // line indices with detected mistakes
       offTrack: false,        // true when recitation is completely off from expected text
+      offTrackLine: -1,       // which line triggered off-track (must match THIS line's words to resume)
     };
 
     // ============================================================
@@ -1199,17 +1200,27 @@
       // Don't process if no Whisper worker (page switch in progress)
       if (!State.audioWorkletNode) return;
 
-      // If already off-track, require a STRONG match to resume (≥2 matched words).
-      // 1/14 matches is noise, not "back on track".
+      // If already off-track, only resume if the user recites words from
+      // the SPECIFIC line that triggered off-track. Matching random words
+      // from other lines doesn't count — the user must correct the mistake.
       // User can also manually clear with ↑ (tapHideLast).
       if (State.offTrack) {
-        if (result.matchedCount >= 2) {
-          dbg('Back on track — strong match (≥2 words), resuming');
-          State.segmentEls.forEach(seg => seg.classList.remove('off-track'));
-          State.offTrack = false;
-          // Fall through to normal processing below
+        const otl = State.offTrackLine;
+        const otlRange = State.lineWordRanges[otl];
+        if (otlRange && result.matchedCount >= 1) {
+          // Check that the new word index falls within the off-track line's range
+          if (result.newWordIdx >= otlRange.start && result.newWordIdx <= otlRange.end) {
+            dbg(`Back on track — matched words in line ${otl + 1} (the mistake line)`);
+            State.segmentEls.forEach(seg => seg.classList.remove('off-track'));
+            State.offTrack = false;
+            State.offTrackLine = -1;
+            // Fall through to normal processing below
+          } else {
+            dbg(`Off-track — matched words are NOT in line ${otl + 1}, staying red`);
+            return;
+          }
         } else {
-          dbg(`Off-track — ignoring (${result.matchedCount} matched, need ≥2 or press ↑)`);
+          dbg(`Off-track — ignoring (${result.matchedCount} matched, need match in line ${otl + 1} or press ↑)`);
           return;
         }
       }
@@ -1217,7 +1228,9 @@
       // Off-track: reciter is saying something completely different.
       // Highlight only the RELEVANT lines (current + last 2 revealed).
       if (result.offTrack) {
-        dbg('⚠ Off-track! Recitation does not match page — highlighting red');
+        dbg(`⚠ Off-track! Recitation does not match page — highlighting red`);
+        // Record which line triggered it — must recite THIS line to resume
+        State.offTrackLine = State.currentLine;
         // Find which lines to highlight: the active line + last couple revealed
         const cur = State.currentLine;
         for (let li = 0; li < State.segmentEls.length; li++) {
@@ -1848,6 +1861,7 @@
       State.analyser = null;
       State.lastTranscription = '';
       State.offTrack = false;
+      State.offTrackLine = -1;
       State.engine = null;
       updateEngineBadge();
       document.getElementById('level-fill').style.width = '0%';
@@ -1976,6 +1990,7 @@
           // Clear off-track state — user is manually correcting
           if (State.offTrack) {
             State.offTrack = false;
+            State.offTrackLine = -1;
             State.segmentEls.forEach(s => s.classList.remove('off-track'));
             dbg('Off-track cleared by manual hide');
           }
