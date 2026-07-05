@@ -1199,29 +1199,40 @@
       // Don't process if no Whisper worker (page switch in progress)
       if (!State.audioWorkletNode) return;
 
+      // If already off-track, require a STRONG match to resume (≥2 matched words).
+      // 1/14 matches is noise, not "back on track".
+      // User can also manually clear with ↑ (tapHideLast).
+      if (State.offTrack) {
+        if (result.matchedCount >= 2) {
+          dbg('Back on track — strong match (≥2 words), resuming');
+          State.segmentEls.forEach(seg => seg.classList.remove('off-track'));
+          State.offTrack = false;
+          // Fall through to normal processing below
+        } else {
+          dbg(`Off-track — ignoring (${result.matchedCount} matched, need ≥2 or press ↑)`);
+          return;
+        }
+      }
+
       // Off-track: reciter is saying something completely different.
-      // Highlight relevant lines in light red and stop advancing.
+      // Highlight only the RELEVANT lines (current + last 2 revealed).
       if (result.offTrack) {
         dbg('⚠ Off-track! Recitation does not match page — highlighting red');
-        // Highlight all revealed lines around the current position
+        // Find which lines to highlight: the active line + last couple revealed
+        const cur = State.currentLine;
         for (let li = 0; li < State.segmentEls.length; li++) {
           const seg = State.segmentEls[li];
           if (!seg) continue;
-          // Only mark lines that are revealed or active (visible to user)
-          if (seg.classList.contains('revealed') || seg.classList.contains('active')) {
-            seg.classList.add('off-track');
+          // Only highlight lines near the current position (within 2 lines)
+          if (Math.abs(li - cur) <= 2) {
+            if (seg.classList.contains('revealed') || seg.classList.contains('active')) {
+              seg.classList.add('off-track');
+            }
           }
         }
         State.offTrack = true;
-        updateStatus(' ⚠ التلاوة غير مطابقة — راجع السطور الحمراء ', 'error');
+        updateStatus(' ⚠ التلاوة غير مطابقة — صحح أو اضغط ↑ ', 'error');
         return;
-      }
-
-      // Back on track — remove red highlights
-      if (State.offTrack) {
-        dbg('Back on track — removing red highlights');
-        State.segmentEls.forEach(seg => seg.classList.remove('off-track'));
-        State.offTrack = false;
       }
 
       if (result.matchedCount === 0) {
